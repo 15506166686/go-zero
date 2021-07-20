@@ -11,32 +11,28 @@ import (
 
 func TestGenCacheKeys(t *testing.T) {
 	primaryField := &parser.Field{
-		Name:         stringx.From("id"),
-		DataBaseType: "bigint",
-		DataType:     "int64",
-		Comment:      "自增id",
-		SeqInIndex:   1,
+		Name:       stringx.From("id"),
+		DataType:   "int64",
+		Comment:    "自增id",
+		SeqInIndex: 1,
 	}
 	mobileField := &parser.Field{
-		Name:         stringx.From("mobile"),
-		DataBaseType: "varchar",
-		DataType:     "string",
-		Comment:      "手机号",
-		SeqInIndex:   1,
+		Name:       stringx.From("mobile"),
+		DataType:   "string",
+		Comment:    "手机号",
+		SeqInIndex: 1,
 	}
 	classField := &parser.Field{
-		Name:         stringx.From("class"),
-		DataBaseType: "varchar",
-		DataType:     "string",
-		Comment:      "班级",
-		SeqInIndex:   1,
+		Name:       stringx.From("class"),
+		DataType:   "string",
+		Comment:    "班级",
+		SeqInIndex: 1,
 	}
 	nameField := &parser.Field{
-		Name:         stringx.From("name"),
-		DataBaseType: "varchar",
-		DataType:     "string",
-		Comment:      "姓名",
-		SeqInIndex:   2,
+		Name:       stringx.From("name"),
+		DataType:   "string",
+		Comment:    "姓名",
+		SeqInIndex: 2,
 	}
 	primariCacheKey, uniqueCacheKey := genCacheKeys(parser.Table{
 		Name: stringx.From("user"),
@@ -53,23 +49,20 @@ func TestGenCacheKeys(t *testing.T) {
 				nameField,
 			},
 		},
-		NormalIndex: nil,
 		Fields: []*parser.Field{
 			primaryField,
 			mobileField,
 			classField,
 			nameField,
 			{
-				Name:         stringx.From("createTime"),
-				DataBaseType: "timestamp",
-				DataType:     "time.Time",
-				Comment:      "创建时间",
+				Name:     stringx.From("createTime"),
+				DataType: "time.Time",
+				Comment:  "创建时间",
 			},
 			{
-				Name:         stringx.From("updateTime"),
-				DataBaseType: "timestamp",
-				DataType:     "time.Time",
-				Comment:      "更新时间",
+				Name:     stringx.From("updateTime"),
+				DataType: "time.Time",
+				Comment:  "更新时间",
 			},
 		},
 	})
@@ -78,8 +71,8 @@ func TestGenCacheKeys(t *testing.T) {
 		assert.Equal(t, true, func() bool {
 			return cacheKeyEqual(primariCacheKey, Key{
 				VarLeft:           "cacheUserIdPrefix",
-				VarRight:          `"cache#user#id#"`,
-				VarExpression:     `cacheUserIdPrefix = "cache#user#id#"`,
+				VarRight:          `"cache:user:id:"`,
+				VarExpression:     `cacheUserIdPrefix = "cache:user:id:"`,
 				KeyLeft:           "userIdKey",
 				KeyRight:          `fmt.Sprintf("%s%v", cacheUserIdPrefix, id)`,
 				DataKeyRight:      `fmt.Sprintf("%s%v", cacheUserIdPrefix, data.Id)`,
@@ -95,19 +88,19 @@ func TestGenCacheKeys(t *testing.T) {
 			expected := []Key{
 				{
 					VarLeft:           "cacheUserClassNamePrefix",
-					VarRight:          `"cache#user#class#name#"`,
-					VarExpression:     `cacheUserClassNamePrefix = "cache#user#class#name#"`,
+					VarRight:          `"cache:user:class:name:"`,
+					VarExpression:     `cacheUserClassNamePrefix = "cache:user:class:name:"`,
 					KeyLeft:           "userClassNameKey",
-					KeyRight:          `fmt.Sprintf("%s%v%v", cacheUserClassNamePrefix, class, name)`,
-					DataKeyRight:      `fmt.Sprintf("%s%v%v", cacheUserClassNamePrefix, data.Class, data.Name)`,
-					KeyExpression:     `userClassNameKey := fmt.Sprintf("%s%v%v", cacheUserClassNamePrefix, class, name)`,
-					DataKeyExpression: `userClassNameKey := fmt.Sprintf("%s%v%v", cacheUserClassNamePrefix, data.Class, data.Name)`,
+					KeyRight:          `fmt.Sprintf("%s%v:%v", cacheUserClassNamePrefix, class, name)`,
+					DataKeyRight:      `fmt.Sprintf("%s%v:%v", cacheUserClassNamePrefix, data.Class, data.Name)`,
+					KeyExpression:     `userClassNameKey := fmt.Sprintf("%s%v:%v", cacheUserClassNamePrefix, class, name)`,
+					DataKeyExpression: `userClassNameKey := fmt.Sprintf("%s%v:%v", cacheUserClassNamePrefix, data.Class, data.Name)`,
 					FieldNameJoin:     []string{"class", "name"},
 				},
 				{
 					VarLeft:           "cacheUserMobilePrefix",
-					VarRight:          `"cache#user#mobile#"`,
-					VarExpression:     `cacheUserMobilePrefix = "cache#user#mobile#"`,
+					VarRight:          `"cache:user:mobile:"`,
+					VarExpression:     `cacheUserMobilePrefix = "cache:user:mobile:"`,
 					KeyLeft:           "userMobileKey",
 					KeyRight:          `fmt.Sprintf("%s%v", cacheUserMobilePrefix, mobile)`,
 					DataKeyRight:      `fmt.Sprintf("%s%v", cacheUserMobilePrefix, data.Mobile)`,
@@ -136,7 +129,7 @@ func TestGenCacheKeys(t *testing.T) {
 	})
 }
 
-func cacheKeyEqual(k1 Key, k2 Key) bool {
+func cacheKeyEqual(k1, k2 Key) bool {
 	k1Join := k1.FieldNameJoin
 	k2Join := k2.FieldNameJoin
 	sort.Strings(k1Join)
