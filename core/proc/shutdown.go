@@ -1,4 +1,4 @@
-// +build linux darwin
+//go:build linux || darwin
 
 package proc
 
@@ -9,7 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tal-tech/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/threading"
 )
 
 const (
@@ -41,18 +42,28 @@ func SetTimeToForceQuit(duration time.Duration) {
 	delayTimeBeforeForceQuit = duration
 }
 
-func gracefulStop(signals chan os.Signal) {
+// Shutdown calls the registered shutdown listeners, only for test purpose.
+func Shutdown() {
+	shutdownListeners.notifyListeners()
+}
+
+// WrapUp wraps up the process, only for test purpose.
+func WrapUp() {
+	wrapUpListeners.notifyListeners()
+}
+
+func gracefulStop(signals chan os.Signal, sig syscall.Signal) {
 	signal.Stop(signals)
 
-	logx.Info("Got signal SIGTERM, shutting down...")
-	wrapUpListeners.notifyListeners()
+	logx.Infof("Got signal %d, shutting down...", sig)
+	go wrapUpListeners.notifyListeners()
 
 	time.Sleep(wrapUpTime)
-	shutdownListeners.notifyListeners()
+	go shutdownListeners.notifyListeners()
 
 	time.Sleep(delayTimeBeforeForceQuit - wrapUpTime)
 	logx.Infof("Still alive after %v, going to force kill the process...", delayTimeBeforeForceQuit)
-	syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+	_ = syscall.Kill(syscall.Getpid(), sig)
 }
 
 type listenerManager struct {
@@ -80,7 +91,11 @@ func (lm *listenerManager) notifyListeners() {
 	lm.lock.Lock()
 	defer lm.lock.Unlock()
 
+	group := threading.NewRoutineGroup()
 	for _, listener := range lm.listeners {
-		listener()
+		group.RunSafe(listener)
 	}
+	group.Wait()
+
+	lm.listeners = nil
 }

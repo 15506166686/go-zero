@@ -2,8 +2,9 @@ package stringx
 
 import (
 	"errors"
+	"unicode"
 
-	"github.com/tal-tech/go-zero/core/lang"
+	"github.com/zeromicro/go-zero/core/lang"
 )
 
 var (
@@ -40,6 +41,24 @@ func Filter(s string, filter func(r rune) bool) string {
 	return string(chars[:n])
 }
 
+// FirstN returns first n runes from s.
+func FirstN(s string, n int, ellipsis ...string) string {
+	var i int
+
+	for j := range s {
+		if i == n {
+			ret := s[:j]
+			for _, each := range ellipsis {
+				ret += each
+			}
+			return ret
+		}
+		i++
+	}
+
+	return s
+}
+
 // HasEmpty checks if there are empty strings in args.
 func HasEmpty(args ...string) bool {
 	for _, arg := range args {
@@ -49,6 +68,33 @@ func HasEmpty(args ...string) bool {
 	}
 
 	return false
+}
+
+// Join joins any number of elements into a single string, separating them with given sep.
+// Empty elements are ignored. However, if the argument list is empty or all its elements are empty,
+// Join returns an empty string.
+func Join(sep byte, elem ...string) string {
+	var size int
+	for _, e := range elem {
+		size += len(e)
+	}
+	if size == 0 {
+		return ""
+	}
+
+	buf := make([]byte, 0, size+len(elem)-1)
+	for _, e := range elem {
+		if len(e) == 0 {
+			continue
+		}
+
+		if len(buf) > 0 {
+			buf = append(buf, sep)
+		}
+		buf = append(buf, e...)
+	}
+
+	return string(buf)
 }
 
 // NotEmpty checks if all strings are not empty in args.
@@ -85,7 +131,8 @@ func Reverse(s string) string {
 	return string(runes)
 }
 
-// Substr returns runes between start and stop [start, stop) regardless of the chars are ascii or utf8.
+// Substr returns runes between start and stop [start, stop)
+// regardless of the chars are ascii or utf8.
 func Substr(str string, start, stop int) (string, error) {
 	rs := []rune(str)
 	length := len(rs)
@@ -117,6 +164,15 @@ func TakeWithPriority(fns ...func() string) string {
 		if len(val) > 0 {
 			return val
 		}
+	}
+
+	return ""
+}
+
+// ToCamelCase returns the string that converts the first letter to lowercase.
+func ToCamelCase(s string) string {
+	for i, v := range s {
+		return string(unicode.ToLower(v)) + s[i+1:]
 	}
 
 	return ""

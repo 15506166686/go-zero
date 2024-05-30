@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/tal-tech/go-zero/tools/goctl/api/parser/g4/gen/api"
+	"github.com/zeromicro/go-zero/tools/goctl/api/parser/g4/gen/api"
 )
 
 // Service describes service for api syntax
@@ -71,13 +71,14 @@ type Route struct {
 
 // Body describes request,response body ast for api syntax
 type Body struct {
-	Lp   Expr
-	Rp   Expr
-	Name DataType
+	ReturnExpr Expr
+	Lp         Expr
+	Rp         Expr
+	Name       DataType
 }
 
 // VisitServiceSpec implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitServiceSpec(ctx *api.ServiceSpecContext) interface{} {
+func (v *ApiVisitor) VisitServiceSpec(ctx *api.ServiceSpecContext) any {
 	var serviceSpec Service
 	if ctx.AtServer() != nil {
 		serviceSpec.AtServer = ctx.AtServer().Accept(v).(*AtServer)
@@ -88,7 +89,7 @@ func (v *ApiVisitor) VisitServiceSpec(ctx *api.ServiceSpecContext) interface{} {
 }
 
 // VisitAtServer implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitAtServer(ctx *api.AtServerContext) interface{} {
+func (v *ApiVisitor) VisitAtServer(ctx *api.AtServerContext) any {
 	var atServer AtServer
 	atServer.AtServerToken = v.newExprWithTerminalNode(ctx.ATSERVER())
 	atServer.Lp = v.newExprWithToken(ctx.GetLp())
@@ -102,7 +103,7 @@ func (v *ApiVisitor) VisitAtServer(ctx *api.AtServerContext) interface{} {
 }
 
 // VisitServiceApi implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitServiceApi(ctx *api.ServiceApiContext) interface{} {
+func (v *ApiVisitor) VisitServiceApi(ctx *api.ServiceApiContext) any {
 	var serviceApi ServiceApi
 	serviceApi.ServiceToken = v.newExprWithToken(ctx.GetServiceToken())
 	serviceName := ctx.ServiceName()
@@ -118,7 +119,7 @@ func (v *ApiVisitor) VisitServiceApi(ctx *api.ServiceApiContext) interface{} {
 }
 
 // VisitServiceRoute implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitServiceRoute(ctx *api.ServiceRouteContext) interface{} {
+func (v *ApiVisitor) VisitServiceRoute(ctx *api.ServiceRouteContext) any {
 	var serviceRoute ServiceRoute
 	if ctx.AtDoc() != nil {
 		serviceRoute.AtDoc = ctx.AtDoc().Accept(v).(*AtDoc)
@@ -135,7 +136,7 @@ func (v *ApiVisitor) VisitServiceRoute(ctx *api.ServiceRouteContext) interface{}
 }
 
 // VisitAtDoc implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitAtDoc(ctx *api.AtDocContext) interface{} {
+func (v *ApiVisitor) VisitAtDoc(ctx *api.AtDocContext) any {
 	var atDoc AtDoc
 	atDoc.AtDocToken = v.newExprWithTerminalNode(ctx.ATDOC())
 
@@ -165,7 +166,7 @@ func (v *ApiVisitor) VisitAtDoc(ctx *api.AtDocContext) interface{} {
 }
 
 // VisitAtHandler implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitAtHandler(ctx *api.AtHandlerContext) interface{} {
+func (v *ApiVisitor) VisitAtHandler(ctx *api.AtHandlerContext) any {
 	var atHandler AtHandler
 	astHandlerExpr := v.newExprWithTerminalNode(ctx.ATHANDLER())
 	atHandler.AtHandlerToken = astHandlerExpr
@@ -176,7 +177,7 @@ func (v *ApiVisitor) VisitAtHandler(ctx *api.AtHandlerContext) interface{} {
 }
 
 // VisitRoute implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitRoute(ctx *api.RouteContext) interface{} {
+func (v *ApiVisitor) VisitRoute(ctx *api.RouteContext) any {
 	var route Route
 	path := ctx.Path()
 	methodExpr := v.newExprWithToken(ctx.GetHttpMethod())
@@ -193,15 +194,11 @@ func (v *ApiVisitor) VisitRoute(ctx *api.RouteContext) interface{} {
 	if ctx.GetResponse() != nil {
 		reply := ctx.GetResponse().Accept(v)
 		if reply != nil {
-			route.Reply = reply.(*Body)
+			resp := reply.(*Body)
+			route.ReturnToken = resp.ReturnExpr
+			resp.ReturnExpr = nil
+			route.Reply = resp
 		}
-	}
-	if ctx.GetReturnToken() != nil {
-		returnExpr := v.newExprWithToken(ctx.GetReturnToken())
-		if ctx.GetReturnToken().GetText() != "returns" {
-			v.panic(returnExpr, fmt.Sprintf("expecting returns, found input '%s'", ctx.GetReturnToken().GetText()))
-		}
-		route.ReturnToken = returnExpr
 	}
 
 	route.DocExpr = v.getDoc(ctx)
@@ -210,27 +207,51 @@ func (v *ApiVisitor) VisitRoute(ctx *api.RouteContext) interface{} {
 }
 
 // VisitBody implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitBody(ctx *api.BodyContext) interface{} {
+func (v *ApiVisitor) VisitBody(ctx *api.BodyContext) any {
 	if ctx.ID() == nil {
+		if v.debug {
+			msg := fmt.Sprintf(
+				`%s line %d:  expr "()" is deprecated, if there has no request body, please omit it`,
+				v.prefix,
+				ctx.GetStart().GetLine(),
+			)
+			v.log.Warning(msg)
+		}
 		return nil
 	}
 
-	idRxpr := v.newExprWithTerminalNode(ctx.ID())
-	if api.IsGolangKeyWord(idRxpr.Text()) {
-		v.panic(idRxpr, fmt.Sprintf("expecting 'ID', but found golang keyword '%s'", idRxpr.Text()))
+	idExpr := v.newExprWithTerminalNode(ctx.ID())
+	if api.IsGolangKeyWord(idExpr.Text()) {
+		v.panic(idExpr, fmt.Sprintf("expecting 'ID', but found golang keyword '%s'", idExpr.Text()))
 	}
 
 	return &Body{
 		Lp:   v.newExprWithToken(ctx.GetLp()),
 		Rp:   v.newExprWithToken(ctx.GetRp()),
-		Name: &Literal{Literal: idRxpr},
+		Name: &Literal{Literal: idExpr},
 	}
 }
 
 // VisitReplybody implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitReplybody(ctx *api.ReplybodyContext) interface{} {
+func (v *ApiVisitor) VisitReplybody(ctx *api.ReplybodyContext) any {
 	if ctx.DataType() == nil {
+		if v.debug {
+			msg := fmt.Sprintf(
+				`%s line %d:  expr "returns ()" or "()" is deprecated, if there has no response body, please omit it`,
+				v.prefix,
+				ctx.GetStart().GetLine(),
+			)
+			v.log.Warning(msg)
+		}
 		return nil
+	}
+
+	var returnExpr Expr
+	if ctx.GetReturnToken() != nil {
+		returnExpr = v.newExprWithToken(ctx.GetReturnToken())
+		if ctx.GetReturnToken().GetText() != "returns" {
+			v.panic(returnExpr, fmt.Sprintf("expecting returns, found input '%s'", ctx.GetReturnToken().GetText()))
+		}
 	}
 
 	dt := ctx.DataType().Accept(v).(DataType)
@@ -251,20 +272,18 @@ func (v *ApiVisitor) VisitReplybody(ctx *api.ReplybodyContext) interface{} {
 		}
 	case *Literal:
 		lit := dataType.Literal.Text()
-		if api.IsGolangKeyWord(dataType.Literal.Text()) {
-			v.panic(dataType.Literal, fmt.Sprintf("expecting 'ID', but found golang keyword '%s'", dataType.Literal.Text()))
-		}
-		if api.IsBasicType(lit) {
-			v.panic(dt.Expr(), fmt.Sprintf("unsupport %s", dt.Expr().Text()))
+		if api.IsGolangKeyWord(lit) {
+			v.panic(dataType.Literal, fmt.Sprintf("expecting 'ID', but found golang keyword '%s'", lit))
 		}
 	default:
 		v.panic(dt.Expr(), fmt.Sprintf("unsupport %s", dt.Expr().Text()))
 	}
 
 	return &Body{
-		Lp:   v.newExprWithToken(ctx.GetLp()),
-		Rp:   v.newExprWithToken(ctx.GetRp()),
-		Name: dt,
+		ReturnExpr: returnExpr,
+		Lp:         v.newExprWithToken(ctx.GetLp()),
+		Rp:         v.newExprWithToken(ctx.GetRp()),
+		Name:       dt,
 	}
 }
 
@@ -275,7 +294,7 @@ func (b *Body) Format() error {
 }
 
 // Equal compares whether the element literals in two Body are equal
-func (b *Body) Equal(v interface{}) bool {
+func (b *Body) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -313,7 +332,7 @@ func (r *Route) Comment() Expr {
 }
 
 // Equal compares whether the element literals in two Route are equal
-func (r *Route) Equal(v interface{}) bool {
+func (r *Route) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -369,7 +388,7 @@ func (a *AtHandler) Format() error {
 }
 
 // Equal compares whether the element literals in two AtHandler are equal
-func (a *AtHandler) Equal(v interface{}) bool {
+func (a *AtHandler) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -397,7 +416,7 @@ func (a *AtDoc) Format() error {
 }
 
 // Equal compares whether the element literals in two AtDoc are equal
-func (a *AtDoc) Equal(v interface{}) bool {
+func (a *AtDoc) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -454,7 +473,7 @@ func (a *AtServer) Format() error {
 }
 
 // Equal compares whether the element literals in two AtServer are equal
-func (a *AtServer) Equal(v interface{}) bool {
+func (a *AtServer) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -502,7 +521,7 @@ func (a *AtServer) Equal(v interface{}) bool {
 }
 
 // Equal compares whether the element literals in two ServiceRoute are equal
-func (s *ServiceRoute) Equal(v interface{}) bool {
+func (s *ServiceRoute) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -553,7 +572,7 @@ func (a *ServiceApi) Format() error {
 }
 
 // Equal compares whether the element literals in two ServiceApi are equal
-func (a *ServiceApi) Equal(v interface{}) bool {
+func (a *ServiceApi) Equal(v any) bool {
 	if v == nil {
 		return false
 	}
@@ -611,7 +630,7 @@ func (s *Service) Format() error {
 }
 
 // Equal compares whether the element literals in two Service are equal
-func (s *Service) Equal(v interface{}) bool {
+func (s *Service) Equal(v any) bool {
 	if v == nil {
 		return false
 	}

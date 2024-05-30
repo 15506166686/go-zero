@@ -1,328 +1,72 @@
 package gogen
 
 import (
+	_ "embed"
+	"go/ast"
 	goformat "go/format"
-	"io/ioutil"
+	"go/importer"
+	goparser "go/parser"
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/tal-tech/go-zero/tools/goctl/api/parser"
-	"github.com/tal-tech/go-zero/tools/goctl/rpc/execx"
+	"github.com/zeromicro/go-zero/tools/goctl/api/parser"
+	"github.com/zeromicro/go-zero/tools/goctl/pkg/env"
+	"github.com/zeromicro/go-zero/tools/goctl/rpc/execx"
+	"github.com/zeromicro/go-zero/tools/goctl/util/pathx"
 )
 
-const testApiTemplate = `
-info(
-    title: doc title
-    desc: ">
-    doc description first part,
-    doc description second part<"
-    version: 1.0
+var (
+	//go:embed testdata/test_api_template.api
+	testApiTemplate string
+	//go:embed testdata/test_multi_service_template.api
+	testMultiServiceTemplate string
+	//go:embed testdata/ap_ino_info.api
+	apiNoInfo string
+	//go:embed testdata/invalid_api_file.api
+	invalidApiFile string
+	//go:embed testdata/anonymous_annotation.api
+	anonymousAnnotation string
+	//go:embed testdata/api_has_middleware.api
+	apiHasMiddleware string
+	//go:embed testdata/api_jwt.api
+	apiJwt string
+	//go:embed testdata/api_jwt_with_middleware.api
+	apiJwtWithMiddleware string
+	//go:embed testdata/api_has_no_request.api
+	apiHasNoRequest string
+	//go:embed testdata/api_route_test.api
+	apiRouteTest string
+	//go:embed testdata/has_comment_api_test.api
+	hasCommentApiTest string
+	//go:embed testdata/has_inline_no_exist_test.api
+	hasInlineNoExistTest string
+	//go:embed testdata/import_api.api
+	importApi string
+	//go:embed testdata/has_import_api.api
+	hasImportApi string
+	//go:embed testdata/no_struct_tag_api.api
+	noStructTagApi string
+	//go:embed testdata/nest_type_api.api
+	nestTypeApi string
+	//go:embed testdata/import_twice.api
+	importTwiceApi string
+	//go:embed testdata/another_import_api.api
+	anotherImportApi string
 )
-
-// TODO: test
-// {
-type Request struct {  // TODO: test
-  // TODO
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `   // }
-} // TODO: test
-
-// TODO: test
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-@server(
-    // C0
-	group: greet/s1
-)
-// C1
-service A-api {
-  // C2
-  @server( // C3
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)   // hello
-	
-  // C4
-  @handler NoResponseHandler  // C5
-  get /greet/get(Request)
-}
-`
-
-const testMultiServiceTemplate = `
-info(
-    title: doc title
-    desc: doc description first part
-    version: 1.0
-)
-
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + ` 
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-service A-api {
-  @server(
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)
-}
-
-service A-api {
-  @server(
-    handler: NoResponseHandler
-  )
-  get /greet/get(Request) returns
-}
-`
-
-const apiNoInfo = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-service A-api {
-  @server(
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const invalidApiFile = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-service A-api
-  @server(
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const anonymousAnnotation = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-service A-api {
-  @handler GreetHandler
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const apiHasMiddleware = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-@server(
-	middleware: TokenValidate
-)
-service A-api {
-  @handler GreetHandler
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const apiJwt = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-@server(
-	jwt: Auth
-	signature: true
-)
-service A-api {
-  @handler GreetHandler
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const apiJwtWithMiddleware = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-
-@server(
-	jwt: Auth
-	middleware: TokenValidate
-)
-service A-api {
-  @handler GreetHandler
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const apiHasNoRequest = `
-service A-api {
-  @handler GreetHandler
-  post /greet/ping ()
-}
-`
-
-const apiRouteTest = `
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + `
-}
-service A-api {
-  @handler NormalHandler
-  get /greet/from/:name(Request) returns (Response)
-  @handler NoResponseHandler
-  get /greet/from/:sex(Request)
-  @handler NoRequestHandler
-  get /greet/from/request returns (Response)
-  @handler NoRequestNoResponseHandler
-  get /greet/from
-}
-`
-
-const hasCommentApiTest = `
-type Inline struct {
-
-}
-
-type Request struct {
-  Inline 
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + ` // name in path
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"msg"` + "`" + ` // message
-}
-
-service A-api {
-  @doc ("helloworld")
-  @server(
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const hasInlineNoExistTest = `
-
-type Request struct {
-  Inline 
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + ` // message
-}
-
-service A-api {
-  @doc ("helloworld")
-  @server(
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const importApi = `
-type ImportData struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-`
-
-const hasImportApi = `
-import "importApi.api"
-
-type Request struct {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type Response struct {
-  Message string ` + "`" + `json:"message"` + "`" + ` // message
-}
-
-service A-api {
-  @server(
-    handler: GreetHandler
-  )
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const noStructTagApi = `
-type Request {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-}
-
-type XXX {}
-
-type (
-	Response {
-  		Message string ` + "`" + `json:"message"` + "`" + `
-	}
-
-	A {}
-
-	B struct {}
-)
-
-service A-api {
-  @handler GreetHandler
-  get /greet/from/:name(Request) returns (Response)
-}
-`
-
-const nestTypeApi = `
-type Request {
-  Name string ` + "`" + `path:"name,options=you|me"` + "`" + `
-  XXX struct {
-  }
-}
-
-service A-api {
-  @handler GreetHandler
-  get /greet/from/:name(Request)
-}
-`
 
 func TestParser(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(testApiTemplate), os.ModePerm)
+	err := os.WriteFile(filename, []byte(testApiTemplate), os.ModePerm)
 	assert.Nil(t, err)
-	defer os.Remove(filename)
+	env.Set(t, env.GoctlExperimental, "off")
+	t.Cleanup(func() {
+		os.Remove(filename)
+	})
 
 	api, err := parser.Parse(filename)
 	assert.Nil(t, err)
@@ -341,7 +85,7 @@ func TestParser(t *testing.T) {
 
 func TestMultiService(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(testMultiServiceTemplate), os.ModePerm)
+	err := os.WriteFile(filename, []byte(testMultiServiceTemplate), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -356,7 +100,7 @@ func TestMultiService(t *testing.T) {
 
 func TestApiNoInfo(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(apiNoInfo), os.ModePerm)
+	err := os.WriteFile(filename, []byte(apiNoInfo), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -368,7 +112,7 @@ func TestApiNoInfo(t *testing.T) {
 
 func TestInvalidApiFile(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(invalidApiFile), os.ModePerm)
+	err := os.WriteFile(filename, []byte(invalidApiFile), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -378,7 +122,7 @@ func TestInvalidApiFile(t *testing.T) {
 
 func TestAnonymousAnnotation(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(anonymousAnnotation), os.ModePerm)
+	err := os.WriteFile(filename, []byte(anonymousAnnotation), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -393,7 +137,7 @@ func TestAnonymousAnnotation(t *testing.T) {
 
 func TestApiHasMiddleware(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(apiHasMiddleware), os.ModePerm)
+	err := os.WriteFile(filename, []byte(apiHasMiddleware), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -405,7 +149,7 @@ func TestApiHasMiddleware(t *testing.T) {
 
 func TestApiHasJwt(t *testing.T) {
 	filename := "jwt.api"
-	err := ioutil.WriteFile(filename, []byte(apiJwt), os.ModePerm)
+	err := os.WriteFile(filename, []byte(apiJwt), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -417,7 +161,7 @@ func TestApiHasJwt(t *testing.T) {
 
 func TestApiHasJwtAndMiddleware(t *testing.T) {
 	filename := "jwt.api"
-	err := ioutil.WriteFile(filename, []byte(apiJwtWithMiddleware), os.ModePerm)
+	err := os.WriteFile(filename, []byte(apiJwtWithMiddleware), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -429,7 +173,7 @@ func TestApiHasJwtAndMiddleware(t *testing.T) {
 
 func TestApiHasNoRequestBody(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(apiHasNoRequest), os.ModePerm)
+	err := os.WriteFile(filename, []byte(apiHasNoRequest), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -439,7 +183,7 @@ func TestApiHasNoRequestBody(t *testing.T) {
 
 func TestApiRoutes(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(apiRouteTest), os.ModePerm)
+	err := os.WriteFile(filename, []byte(apiRouteTest), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -451,7 +195,7 @@ func TestApiRoutes(t *testing.T) {
 
 func TestHasCommentRoutes(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(hasCommentApiTest), os.ModePerm)
+	err := os.WriteFile(filename, []byte(hasCommentApiTest), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -463,7 +207,7 @@ func TestHasCommentRoutes(t *testing.T) {
 
 func TestInlineTypeNotExist(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(hasInlineNoExistTest), os.ModePerm)
+	err := os.WriteFile(filename, []byte(hasInlineNoExistTest), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -473,12 +217,12 @@ func TestInlineTypeNotExist(t *testing.T) {
 
 func TestHasImportApi(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(hasImportApi), os.ModePerm)
+	err := os.WriteFile(filename, []byte(hasImportApi), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
 	importApiName := "importApi.api"
-	err = ioutil.WriteFile(importApiName, []byte(importApi), os.ModePerm)
+	err = os.WriteFile(importApiName, []byte(importApi), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(importApiName)
 
@@ -497,9 +241,49 @@ func TestHasImportApi(t *testing.T) {
 	validate(t, filename)
 }
 
+func TestImportTwiceOnExperimental(t *testing.T) {
+	defaultExperimental := env.Get(env.GoctlExperimental)
+	env.Set(t, env.GoctlExperimental, "on")
+	defer env.Set(t, env.GoctlExperimental, defaultExperimental)
+
+	filename := "greet.api"
+	err := os.WriteFile(filename, []byte(importTwiceApi), os.ModePerm)
+	assert.Nil(t, err)
+	defer os.Remove(filename)
+
+	importApiName := "importApi.api"
+	err = os.WriteFile(importApiName, []byte(importApi), os.ModePerm)
+	assert.Nil(t, err)
+	defer os.Remove(importApiName)
+
+	hasImportApiName := "hasImportApi.api"
+	err = os.WriteFile(hasImportApiName, []byte(hasImportApi), os.ModePerm)
+	assert.Nil(t, err)
+	defer os.Remove(hasImportApiName)
+
+	anotherImportApiName := "anotherImportApi.api"
+	err = os.WriteFile(anotherImportApiName, []byte(anotherImportApi), os.ModePerm)
+	assert.Nil(t, err)
+	defer os.Remove(anotherImportApiName)
+
+	api, err := parser.Parse(filename)
+	assert.Nil(t, err)
+
+	var hasInline bool
+	for _, ty := range api.Types {
+		if ty.Name() == "ImportData" {
+			hasInline = true
+			break
+		}
+	}
+	assert.True(t, hasInline)
+
+	validate(t, filename)
+}
+
 func TestNoStructApi(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(noStructTagApi), os.ModePerm)
+	err := os.WriteFile(filename, []byte(noStructTagApi), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -512,7 +296,7 @@ func TestNoStructApi(t *testing.T) {
 
 func TestNestTypeApi(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(nestTypeApi), os.ModePerm)
+	err := os.WriteFile(filename, []byte(nestTypeApi), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -522,7 +306,7 @@ func TestNestTypeApi(t *testing.T) {
 
 func TestCamelStyle(t *testing.T) {
 	filename := "greet.api"
-	err := ioutil.WriteFile(filename, []byte(testApiTemplate), os.ModePerm)
+	err := os.WriteFile(filename, []byte(testApiTemplate), os.ModePerm)
 	assert.Nil(t, err)
 	defer os.Remove(filename)
 
@@ -537,25 +321,52 @@ func validate(t *testing.T, api string) {
 }
 
 func validateWithCamel(t *testing.T, api, camel string) {
-	dir := "_go"
-	os.RemoveAll(dir)
-	err := DoGenProject(api, dir, camel)
-	defer os.RemoveAll(dir)
+	dir := "workspace"
+	defer func() {
+		os.RemoveAll(dir)
+	}()
+	err := pathx.MkdirIfNotExist(dir)
+	assert.Nil(t, err)
+	err = initMod(dir)
+	assert.Nil(t, err)
+	err = DoGenProject(api, dir, camel)
 	assert.Nil(t, err)
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if strings.HasSuffix(path, ".go") {
-			code, err := ioutil.ReadFile(path)
+			code, err := os.ReadFile(path)
 			assert.Nil(t, err)
 			assert.Nil(t, validateCode(string(code)))
+			if strings.HasSuffix(path, "types.go") {
+				assert.Nil(t, checkRedeclaredType(string(code)))
+			}
 		}
 		return nil
 	})
+}
 
-	_, err = execx.Run("go test ./...", dir)
-	assert.Nil(t, err)
+func initMod(mod string) error {
+	_, err := execx.Run("go mod init "+mod, mod)
+	return err
 }
 
 func validateCode(code string) error {
 	_, err := goformat.Source([]byte(code))
+	return err
+}
+
+func checkRedeclaredType(code string) error {
+	fset := token.NewFileSet()
+	f, err := goparser.ParseFile(fset, "", code, goparser.ParseComments)
+	if err != nil {
+		return err
+	}
+
+	conf := types.Config{
+		Error:    func(err error) {},
+		Importer: importer.Default(),
+	}
+
+	info := types.Info{Types: make(map[ast.Expr]types.TypeAndValue)}
+	_, err = conf.Check(f.Name.Name, fset, []*ast.File{f}, &info)
 	return err
 }

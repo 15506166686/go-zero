@@ -1,18 +1,20 @@
 package discov
 
 import (
-	"github.com/tal-tech/go-zero/core/discov/internal"
-	"github.com/tal-tech/go-zero/core/lang"
-	"github.com/tal-tech/go-zero/core/logx"
-	"github.com/tal-tech/go-zero/core/proc"
-	"github.com/tal-tech/go-zero/core/syncx"
-	"github.com/tal-tech/go-zero/core/threading"
+	"time"
+
+	"github.com/zeromicro/go-zero/core/discov/internal"
+	"github.com/zeromicro/go-zero/core/lang"
+	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/proc"
+	"github.com/zeromicro/go-zero/core/syncx"
+	"github.com/zeromicro/go-zero/core/threading"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 type (
-	// PublisherOption defines the method to customize a Publisher.
-	PublisherOption func(client *Publisher)
+	// PubOption defines the method to customize a Publisher.
+	PubOption func(client *Publisher)
 
 	// A Publisher can be used to publish the value to an etcd cluster on the given key.
 	Publisher struct {
@@ -32,7 +34,7 @@ type (
 // endpoints is the hosts of the etcd cluster.
 // key:value are a pair to be published.
 // opts are used to customize the Publisher.
-func NewPublisher(endpoints []string, key, value string, opts ...PublisherOption) *Publisher {
+func NewPublisher(endpoints []string, key, value string, opts ...PubOption) *Publisher {
 	publisher := &Publisher{
 		endpoints:  endpoints,
 		key:        key,
@@ -51,12 +53,7 @@ func NewPublisher(endpoints []string, key, value string, opts ...PublisherOption
 
 // KeepAlive keeps key:value alive.
 func (p *Publisher) KeepAlive() error {
-	cli, err := internal.GetRegistry().GetConn(p.endpoints)
-	if err != nil {
-		return err
-	}
-
-	p.lease, err = p.register(cli)
+	cli, err := p.doRegister()
 	if err != nil {
 		return err
 	}
@@ -83,6 +80,43 @@ func (p *Publisher) Stop() {
 	p.quit.Close()
 }
 
+func (p *Publisher) doKeepAlive() error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		select {
+		case <-p.quit.Done():
+			return nil
+		default:
+			cli, err := p.doRegister()
+			if err != nil {
+				logx.Errorf("etcd publisher doRegister: %s", err.Error())
+				break
+			}
+
+			if err := p.keepAliveAsync(cli); err != nil {
+				logx.Errorf("etcd publisher keepAliveAsync: %s", err.Error())
+				break
+			}
+
+			return nil
+		}
+	}
+
+	return nil
+}
+
+func (p *Publisher) doRegister() (internal.EtcdClient, error) {
+	cli, err := internal.GetRegistry().GetConn(p.endpoints)
+	if err != nil {
+		return nil, err
+	}
+
+	p.lease, err = p.register(cli)
+	return cli, err
+}
+
 func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 	ch, err := cli.KeepAlive(cli.Ctx(), p.lease)
 	if err != nil {
@@ -95,8 +129,8 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 			case _, ok := <-ch:
 				if !ok {
 					p.revoke(cli)
-					if err := p.KeepAlive(); err != nil {
-						logx.Errorf("KeepAlive: %s", err.Error())
+					if err := p.doKeepAlive(); err != nil {
+						logx.Errorf("etcd publisher KeepAlive: %s", err.Error())
 					}
 					return
 				}
@@ -105,8 +139,8 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 				p.revoke(cli)
 				select {
 				case <-p.resumeChan:
-					if err := p.KeepAlive(); err != nil {
-						logx.Errorf("KeepAlive: %s", err.Error())
+					if err := p.doKeepAlive(); err != nil {
+						logx.Errorf("etcd publisher KeepAlive: %s", err.Error())
 					}
 					return
 				case <-p.quit.Done():
@@ -141,13 +175,27 @@ func (p *Publisher) register(client internal.EtcdClient) (clientv3.LeaseID, erro
 
 func (p *Publisher) revoke(cli internal.EtcdClient) {
 	if _, err := cli.Revoke(cli.Ctx(), p.lease); err != nil {
-		logx.Error(err)
+		logx.Errorf("etcd publisher revoke: %s", err.Error())
 	}
 }
 
 // WithId customizes a Publisher with the id.
-func WithId(id int64) PublisherOption {
+func WithId(id int64) PubOption {
 	return func(publisher *Publisher) {
 		publisher.id = id
+	}
+}
+
+// WithPubEtcdAccount provides the etcd username/password.
+func WithPubEtcdAccount(user, pass string) PubOption {
+	return func(pub *Publisher) {
+		RegisterAccount(pub.endpoints, user, pass)
+	}
+}
+
+// WithPubEtcdTLS provides the etcd CertFile/CertKeyFile/CACertFile.
+func WithPubEtcdTLS(certFile, certKeyFile, caFile string, insecureSkipVerify bool) PubOption {
+	return func(pub *Publisher) {
+		logx.Must(RegisterTLS(pub.endpoints, certFile, certKeyFile, caFile, insecureSkipVerify))
 	}
 }

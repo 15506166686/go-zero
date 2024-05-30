@@ -1,23 +1,27 @@
 package mapping
 
 import (
+	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/tal-tech/go-zero/core/jsonx"
-	"github.com/tal-tech/go-zero/core/lang"
-	"github.com/tal-tech/go-zero/core/stringx"
+	"github.com/zeromicro/go-zero/core/jsonx"
+	"github.com/zeromicro/go-zero/core/lang"
+	"github.com/zeromicro/go-zero/core/proc"
+	"github.com/zeromicro/go-zero/core/stringx"
 )
 
 const (
-	defaultKeyName = "key"
-	delimiter      = '.'
+	defaultKeyName   = "key"
+	delimiter        = '.'
+	ignoreKey        = "-"
+	numberTypeString = "number"
 )
 
 var (
@@ -25,35 +29,34 @@ var (
 	errValueNotSettable = errors.New("value is not settable")
 	errValueNotStruct   = errors.New("value type is not struct")
 	keyUnmarshaler      = NewUnmarshaler(defaultKeyName)
-	cacheKeys           atomic.Value
-	cacheKeysLock       sync.Mutex
 	durationType        = reflect.TypeOf(time.Duration(0))
-	emptyMap            = map[string]interface{}{}
+	cacheKeys           = make(map[string][]string)
+	cacheKeysLock       sync.Mutex
+	defaultCache        = make(map[string]any)
+	defaultCacheLock    sync.Mutex
+	emptyMap            = map[string]any{}
 	emptyValue          = reflect.ValueOf(lang.Placeholder)
 )
 
 type (
-	// A Unmarshaler is used to unmarshal with given tag key.
+	// Unmarshaler is used to unmarshal with the given tag key.
 	Unmarshaler struct {
 		key  string
 		opts unmarshalOptions
 	}
 
-	// UnmarshalOption defines the method to customize a Unmarshaler.
+	// UnmarshalOption defines the method to customize an Unmarshaler.
 	UnmarshalOption func(*unmarshalOptions)
 
 	unmarshalOptions struct {
-		fromString bool
+		fillDefault  bool
+		fromString   bool
+		opaqueKeys   bool
+		canonicalKey func(key string) string
 	}
-
-	keyCache map[string][]string
 )
 
-func init() {
-	cacheKeys.Store(make(keyCache))
-}
-
-// NewUnmarshaler returns a Unmarshaler.
+// NewUnmarshaler returns an Unmarshaler.
 func NewUnmarshaler(key string, opts ...UnmarshalOption) *Unmarshaler {
 	unmarshaler := Unmarshaler{
 		key: key,
@@ -66,57 +69,424 @@ func NewUnmarshaler(key string, opts ...UnmarshalOption) *Unmarshaler {
 	return &unmarshaler
 }
 
-// UnmarshalKey unmarshals m into v with tag key.
-func UnmarshalKey(m map[string]interface{}, v interface{}) error {
+// UnmarshalKey unmarshals m into v with the tag key.
+func UnmarshalKey(m map[string]any, v any) error {
 	return keyUnmarshaler.Unmarshal(m, v)
 }
 
 // Unmarshal unmarshals m into v.
-func (u *Unmarshaler) Unmarshal(m map[string]interface{}, v interface{}) error {
-	return u.UnmarshalValuer(MapValuer(m), v)
+func (u *Unmarshaler) Unmarshal(i, v any) error {
+	return u.unmarshal(i, v, "")
+}
+
+func (u *Unmarshaler) unmarshal(i, v any, fullName string) error {
+	valueType := reflect.TypeOf(v)
+	if valueType.Kind() != reflect.Ptr {
+		return errValueNotSettable
+	}
+
+	elemType := Deref(valueType)
+	switch iv := i.(type) {
+	case map[string]any:
+		if elemType.Kind() != reflect.Struct {
+			return errTypeMismatch
+		}
+
+		return u.unmarshalValuer(mapValuer(iv), v, fullName)
+	case []any:
+		if elemType.Kind() != reflect.Slice {
+			return errTypeMismatch
+		}
+
+		return u.fillSlice(elemType, reflect.ValueOf(v).Elem(), iv, fullName)
+	default:
+		return errUnsupportedType
+	}
 }
 
 // UnmarshalValuer unmarshals m into v.
-func (u *Unmarshaler) UnmarshalValuer(m Valuer, v interface{}) error {
-	return u.unmarshalWithFullName(m, v, "")
+func (u *Unmarshaler) UnmarshalValuer(m Valuer, v any) error {
+	return u.unmarshalValuer(simpleValuer{current: m}, v, "")
 }
 
-func (u *Unmarshaler) unmarshalWithFullName(m Valuer, v interface{}, fullName string) error {
-	rv := reflect.ValueOf(v)
-	if err := ValidatePtr(&rv); err != nil {
+func (u *Unmarshaler) unmarshalValuer(m Valuer, v any, fullName string) error {
+	return u.unmarshalWithFullName(simpleValuer{current: m}, v, fullName)
+}
+
+func (u *Unmarshaler) fillMap(fieldType reflect.Type, value reflect.Value,
+	mapValue any, fullName string) error {
+	if !value.CanSet() {
+		return errValueNotSettable
+	}
+
+	fieldKeyType := fieldType.Key()
+	fieldElemType := fieldType.Elem()
+	targetValue, err := u.generateMap(fieldKeyType, fieldElemType, mapValue, fullName)
+	if err != nil {
 		return err
 	}
 
-	rte := reflect.TypeOf(v).Elem()
-	if rte.Kind() != reflect.Struct {
-		return errValueNotStruct
+	if !targetValue.Type().AssignableTo(value.Type()) {
+		return errTypeMismatch
 	}
 
-	rve := rv.Elem()
-	numFields := rte.NumField()
-	for i := 0; i < numFields; i++ {
-		field := rte.Field(i)
-		if usingDifferentKeys(u.key, field) {
-			continue
-		}
+	value.Set(targetValue)
+	return nil
+}
 
-		if err := u.processField(field, rve.Field(i), m, fullName); err != nil {
+func (u *Unmarshaler) fillMapFromString(value reflect.Value, mapValue any) error {
+	if !value.CanSet() {
+		return errValueNotSettable
+	}
+
+	switch v := mapValue.(type) {
+	case fmt.Stringer:
+		if err := jsonx.UnmarshalFromString(v.String(), value.Addr().Interface()); err != nil {
 			return err
 		}
+	case string:
+		if err := jsonx.UnmarshalFromString(v, value.Addr().Interface()); err != nil {
+			return err
+		}
+	default:
+		return errUnsupportedType
 	}
 
 	return nil
 }
 
+func (u *Unmarshaler) fillSlice(fieldType reflect.Type, value reflect.Value,
+	mapValue any, fullName string) error {
+	if !value.CanSet() {
+		return errValueNotSettable
+	}
+
+	refValue := reflect.ValueOf(mapValue)
+	if refValue.Kind() != reflect.Slice {
+		return newTypeMismatchErrorWithHint(fullName, reflect.Slice.String(), refValue.Type().String())
+	}
+	if refValue.IsNil() {
+		return nil
+	}
+
+	baseType := fieldType.Elem()
+	dereffedBaseType := Deref(baseType)
+	dereffedBaseKind := dereffedBaseType.Kind()
+	conv := reflect.MakeSlice(reflect.SliceOf(baseType), refValue.Len(), refValue.Cap())
+	if refValue.Len() == 0 {
+		value.Set(conv)
+		return nil
+	}
+
+	var valid bool
+	for i := 0; i < refValue.Len(); i++ {
+		ithValue := refValue.Index(i).Interface()
+		if ithValue == nil {
+			continue
+		}
+
+		valid = true
+		sliceFullName := fmt.Sprintf("%s[%d]", fullName, i)
+
+		switch dereffedBaseKind {
+		case reflect.Struct:
+			target := reflect.New(dereffedBaseType)
+			val, ok := ithValue.(map[string]any)
+			if !ok {
+				return errTypeMismatch
+			}
+
+			if err := u.unmarshal(val, target.Interface(), sliceFullName); err != nil {
+				return err
+			}
+
+			SetValue(fieldType.Elem(), conv.Index(i), target.Elem())
+		case reflect.Slice:
+			if err := u.fillSlice(dereffedBaseType, conv.Index(i), ithValue, sliceFullName); err != nil {
+				return err
+			}
+		default:
+			if err := u.fillSliceValue(conv, i, dereffedBaseKind, ithValue, sliceFullName); err != nil {
+				return err
+			}
+		}
+	}
+
+	if valid {
+		value.Set(conv)
+	}
+
+	return nil
+}
+
+func (u *Unmarshaler) fillSliceFromString(fieldType reflect.Type, value reflect.Value,
+	mapValue any, fullName string) error {
+	var slice []any
+	switch v := mapValue.(type) {
+	case fmt.Stringer:
+		if err := jsonx.UnmarshalFromString(v.String(), &slice); err != nil {
+			return fmt.Errorf("fullName: `%s`, error: `%w`", fullName, err)
+		}
+	case string:
+		if err := jsonx.UnmarshalFromString(v, &slice); err != nil {
+			return fmt.Errorf("fullName: `%s`, error: `%w`", fullName, err)
+		}
+	default:
+		return errUnsupportedType
+	}
+
+	baseFieldType := Deref(fieldType.Elem())
+	baseFieldKind := baseFieldType.Kind()
+	conv := reflect.MakeSlice(reflect.SliceOf(baseFieldType), len(slice), cap(slice))
+
+	for i := 0; i < len(slice); i++ {
+		if err := u.fillSliceValue(conv, i, baseFieldKind, slice[i], fullName); err != nil {
+			return err
+		}
+	}
+
+	value.Set(conv)
+	return nil
+}
+
+func (u *Unmarshaler) fillSliceValue(slice reflect.Value, index int,
+	baseKind reflect.Kind, value any, fullName string) error {
+	if value == nil {
+		return errNilSliceElement
+	}
+
+	ithVal := slice.Index(index)
+	switch v := value.(type) {
+	case fmt.Stringer:
+		return setValueFromString(baseKind, ithVal, v.String())
+	case string:
+		return setValueFromString(baseKind, ithVal, v)
+	case map[string]any:
+		return u.fillMap(ithVal.Type(), ithVal, value, fullName)
+	default:
+		// don't need to consider the difference between int, int8, int16, int32, int64,
+		// uint, uint8, uint16, uint32, uint64, because they're handled as json.Number.
+		if ithVal.Kind() == reflect.Ptr {
+			baseType := Deref(ithVal.Type())
+			if !reflect.TypeOf(value).AssignableTo(baseType) {
+				return errTypeMismatch
+			}
+
+			target := reflect.New(baseType).Elem()
+			target.Set(reflect.ValueOf(value))
+			SetValue(ithVal.Type(), ithVal, target)
+			return nil
+		}
+
+		if !reflect.TypeOf(value).AssignableTo(ithVal.Type()) {
+			return errTypeMismatch
+		}
+
+		ithVal.Set(reflect.ValueOf(value))
+		return nil
+	}
+}
+
+func (u *Unmarshaler) fillSliceWithDefault(derefedType reflect.Type, value reflect.Value,
+	defaultValue, fullName string) error {
+	baseFieldType := Deref(derefedType.Elem())
+	baseFieldKind := baseFieldType.Kind()
+	defaultCacheLock.Lock()
+	slice, ok := defaultCache[defaultValue]
+	defaultCacheLock.Unlock()
+	if !ok {
+		if baseFieldKind == reflect.String {
+			slice = parseGroupedSegments(defaultValue)
+		} else if err := jsonx.UnmarshalFromString(defaultValue, &slice); err != nil {
+			return err
+		}
+
+		defaultCacheLock.Lock()
+		defaultCache[defaultValue] = slice
+		defaultCacheLock.Unlock()
+	}
+
+	return u.fillSlice(derefedType, value, slice, fullName)
+}
+
+func (u *Unmarshaler) fillUnmarshalerStruct(fieldType reflect.Type,
+	value reflect.Value, targetValue string) error {
+	if !value.CanSet() {
+		return errValueNotSettable
+	}
+
+	baseType := Deref(fieldType)
+	target := reflect.New(baseType)
+	switch u.key {
+	case jsonTagKey:
+		unmarshaler, ok := target.Interface().(json.Unmarshaler)
+		if !ok {
+			return errUnsupportedType
+		}
+
+		if err := unmarshaler.UnmarshalJSON([]byte(targetValue)); err != nil {
+			return err
+		}
+	default:
+		return errUnsupportedType
+	}
+
+	value.Set(target)
+	return nil
+}
+
+func (u *Unmarshaler) generateMap(keyType, elemType reflect.Type, mapValue any,
+	fullName string) (reflect.Value, error) {
+	mapType := reflect.MapOf(keyType, elemType)
+	valueType := reflect.TypeOf(mapValue)
+	if mapType == valueType {
+		return reflect.ValueOf(mapValue), nil
+	}
+
+	if keyType != valueType.Key() {
+		return emptyValue, errTypeMismatch
+	}
+
+	refValue := reflect.ValueOf(mapValue)
+	targetValue := reflect.MakeMapWithSize(mapType, refValue.Len())
+	dereffedElemType := Deref(elemType)
+	dereffedElemKind := dereffedElemType.Kind()
+
+	for _, key := range refValue.MapKeys() {
+		keythValue := refValue.MapIndex(key)
+		keythData := keythValue.Interface()
+		mapFullName := fmt.Sprintf("%s[%s]", fullName, key.String())
+
+		switch dereffedElemKind {
+		case reflect.Slice:
+			target := reflect.New(dereffedElemType)
+			if err := u.fillSlice(elemType, target.Elem(), keythData, mapFullName); err != nil {
+				return emptyValue, err
+			}
+
+			targetValue.SetMapIndex(key, target.Elem())
+		case reflect.Struct:
+			keythMap, ok := keythData.(map[string]any)
+			if !ok {
+				return emptyValue, errTypeMismatch
+			}
+
+			target := reflect.New(dereffedElemType)
+			if err := u.unmarshal(keythMap, target.Interface(), mapFullName); err != nil {
+				return emptyValue, err
+			}
+
+			SetMapIndexValue(elemType, targetValue, key, target.Elem())
+		case reflect.Map:
+			keythMap, ok := keythData.(map[string]any)
+			if !ok {
+				return emptyValue, errTypeMismatch
+			}
+
+			innerValue, err := u.generateMap(elemType.Key(), elemType.Elem(), keythMap, mapFullName)
+			if err != nil {
+				return emptyValue, err
+			}
+
+			targetValue.SetMapIndex(key, innerValue)
+		default:
+			switch v := keythData.(type) {
+			case bool:
+				if dereffedElemKind != reflect.Bool {
+					return emptyValue, errTypeMismatch
+				}
+
+				targetValue.SetMapIndex(key, reflect.ValueOf(v))
+			case string:
+				if dereffedElemKind != reflect.String {
+					return emptyValue, errTypeMismatch
+				}
+
+				val := reflect.ValueOf(v)
+				if !val.Type().AssignableTo(dereffedElemType) {
+					return emptyValue, errTypeMismatch
+				}
+
+				targetValue.SetMapIndex(key, val)
+			case json.Number:
+				target := reflect.New(dereffedElemType)
+				if err := setValueFromString(dereffedElemKind, target.Elem(), v.String()); err != nil {
+					return emptyValue, err
+				}
+
+				targetValue.SetMapIndex(key, target.Elem())
+			default:
+				if dereffedElemKind != keythValue.Kind() {
+					return emptyValue, errTypeMismatch
+				}
+
+				targetValue.SetMapIndex(key, keythValue)
+			}
+		}
+	}
+
+	return targetValue, nil
+}
+
+func (u *Unmarshaler) implementsUnmarshaler(t reflect.Type) bool {
+	switch u.key {
+	case jsonTagKey:
+		return t.Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem())
+	default:
+		return false
+	}
+}
+
+func (u *Unmarshaler) parseOptionsWithContext(field reflect.StructField, m Valuer, fullName string) (
+	string, *fieldOptionsWithContext, error) {
+	key, options, err := parseKeyAndOptions(u.key, field)
+	if err != nil {
+		return "", nil, err
+	} else if options == nil {
+		return key, nil, nil
+	}
+
+	if u.opts.canonicalKey != nil {
+		key = u.opts.canonicalKey(key)
+
+		if len(options.OptionalDep) > 0 {
+			// need to create a new fieldOption, because the original one is shared through cache.
+			options = &fieldOptions{
+				fieldOptionsWithContext: fieldOptionsWithContext{
+					Inherit:    options.Inherit,
+					FromString: options.FromString,
+					Optional:   options.Optional,
+					Options:    options.Options,
+					Default:    options.Default,
+					EnvVar:     options.EnvVar,
+					Range:      options.Range,
+				},
+				OptionalDep: u.opts.canonicalKey(options.OptionalDep),
+			}
+		}
+	}
+
+	if u.opts.fillDefault {
+		return key, &options.fieldOptionsWithContext, nil
+	}
+
+	optsWithContext, err := options.toOptionsWithContext(key, m, fullName)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return key, optsWithContext, nil
+}
+
 func (u *Unmarshaler) processAnonymousField(field reflect.StructField, value reflect.Value,
-	m Valuer, fullName string) error {
+	m valuerWithParent, fullName string) error {
 	key, options, err := u.parseOptionsWithContext(field, m, fullName)
 	if err != nil {
 		return err
 	}
 
-	if _, hasValue := getValue(m, key); hasValue {
-		return fmt.Errorf("fields of %s can't be wrapped inside, because it's anonymous", key)
+	if key == ignoreKey {
+		return nil
 	}
 
 	if options.optional() {
@@ -127,27 +497,62 @@ func (u *Unmarshaler) processAnonymousField(field reflect.StructField, value ref
 }
 
 func (u *Unmarshaler) processAnonymousFieldOptional(field reflect.StructField, value reflect.Value,
-	key string, m Valuer, fullName string) error {
+	key string, m valuerWithParent, fullName string) error {
+	derefedFieldType := Deref(field.Type)
+
+	switch derefedFieldType.Kind() {
+	case reflect.Struct:
+		return u.processAnonymousStructFieldOptional(field.Type, value, key, m, fullName)
+	default:
+		return u.processNamedField(field, value, m, fullName)
+	}
+}
+
+func (u *Unmarshaler) processAnonymousFieldRequired(field reflect.StructField, value reflect.Value,
+	m valuerWithParent, fullName string) error {
+	fieldType := field.Type
+	maybeNewValue(fieldType, value)
+	derefedFieldType := Deref(fieldType)
+	indirectValue := reflect.Indirect(value)
+
+	switch derefedFieldType.Kind() {
+	case reflect.Struct:
+		for i := 0; i < derefedFieldType.NumField(); i++ {
+			if err := u.processField(derefedFieldType.Field(i), indirectValue.Field(i),
+				m, fullName); err != nil {
+				return err
+			}
+		}
+	default:
+		if err := u.processNamedField(field, indirectValue, m, fullName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (u *Unmarshaler) processAnonymousStructFieldOptional(fieldType reflect.Type,
+	value reflect.Value, key string, m valuerWithParent, fullName string) error {
 	var filled bool
 	var required int
 	var requiredFilled int
 	var indirectValue reflect.Value
-	fieldType := Deref(field.Type)
+	derefedFieldType := Deref(fieldType)
 
-	for i := 0; i < fieldType.NumField(); i++ {
-		subField := fieldType.Field(i)
+	for i := 0; i < derefedFieldType.NumField(); i++ {
+		subField := derefedFieldType.Field(i)
 		fieldKey, fieldOpts, err := u.parseOptionsWithContext(subField, m, fullName)
 		if err != nil {
 			return err
 		}
 
-		_, hasValue := getValue(m, fieldKey)
+		_, hasValue := getValue(m, fieldKey, u.opts.opaqueKeys)
 		if hasValue {
 			if !filled {
 				filled = true
-				maybeNewValue(field, value)
+				maybeNewValue(fieldType, value)
 				indirectValue = reflect.Indirect(value)
-
 			}
 			if err = u.processField(subField, indirectValue.Field(i), m, fullName); err != nil {
 				return err
@@ -162,29 +567,14 @@ func (u *Unmarshaler) processAnonymousFieldOptional(field reflect.StructField, v
 	}
 
 	if filled && required != requiredFilled {
-		return fmt.Errorf("%s is not fully set", key)
+		return fmt.Errorf("%q is not fully set", key)
 	}
 
 	return nil
 }
 
-func (u *Unmarshaler) processAnonymousFieldRequired(field reflect.StructField, value reflect.Value,
-	m Valuer, fullName string) error {
-	maybeNewValue(field, value)
-	fieldType := Deref(field.Type)
-	indirectValue := reflect.Indirect(value)
-
-	for i := 0; i < fieldType.NumField(); i++ {
-		if err := u.processField(fieldType.Field(i), indirectValue.Field(i), m, fullName); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (u *Unmarshaler) processField(field reflect.StructField, value reflect.Value, m Valuer,
-	fullName string) error {
+func (u *Unmarshaler) processField(field reflect.StructField, value reflect.Value,
+	m valuerWithParent, fullName string) error {
 	if usingDifferentKeys(u.key, field) {
 		return nil
 	}
@@ -196,118 +586,125 @@ func (u *Unmarshaler) processField(field reflect.StructField, value reflect.Valu
 	return u.processNamedField(field, value, m, fullName)
 }
 
-func (u *Unmarshaler) processFieldNotFromString(field reflect.StructField, value reflect.Value,
-	mapValue interface{}, opts *fieldOptionsWithContext, fullName string) error {
-	fieldType := field.Type
+func (u *Unmarshaler) processFieldNotFromString(fieldType reflect.Type, value reflect.Value,
+	vp valueWithParent, opts *fieldOptionsWithContext, fullName string) error {
 	derefedFieldType := Deref(fieldType)
 	typeKind := derefedFieldType.Kind()
+	mapValue := vp.value
 	valueKind := reflect.TypeOf(mapValue).Kind()
 
 	switch {
 	case valueKind == reflect.Map && typeKind == reflect.Struct:
-		return u.processFieldStruct(field, value, mapValue, fullName)
+		mv, ok := mapValue.(map[string]any)
+		if !ok {
+			return errTypeMismatch
+		}
+
+		return u.processFieldStruct(fieldType, value, &simpleValuer{
+			current: mapValuer(mv),
+			parent:  vp.parent,
+		}, fullName)
+	case typeKind == reflect.Slice && valueKind == reflect.Slice:
+		return u.fillSlice(fieldType, value, mapValue, fullName)
+	case valueKind == reflect.Map && typeKind == reflect.Map:
+		return u.fillMap(fieldType, value, mapValue, fullName)
+	case valueKind == reflect.String && typeKind == reflect.Map:
+		return u.fillMapFromString(value, mapValue)
 	case valueKind == reflect.String && typeKind == reflect.Slice:
-		return u.fillSliceFromString(fieldType, value, mapValue)
+		return u.fillSliceFromString(fieldType, value, mapValue, fullName)
 	case valueKind == reflect.String && derefedFieldType == durationType:
-		return fillDurationValue(fieldType.Kind(), value, mapValue.(string))
+		return fillDurationValue(fieldType, value, mapValue.(string))
+	case valueKind == reflect.String && typeKind == reflect.Struct && u.implementsUnmarshaler(fieldType):
+		return u.fillUnmarshalerStruct(fieldType, value, mapValue.(string))
 	default:
-		return u.processFieldPrimitive(field, value, mapValue, opts, fullName)
+		return u.processFieldPrimitive(fieldType, value, mapValue, opts, fullName)
 	}
 }
 
-func (u *Unmarshaler) processFieldPrimitive(field reflect.StructField, value reflect.Value,
-	mapValue interface{}, opts *fieldOptionsWithContext, fullName string) error {
-	fieldType := field.Type
+func (u *Unmarshaler) processFieldPrimitive(fieldType reflect.Type, value reflect.Value,
+	mapValue any, opts *fieldOptionsWithContext, fullName string) error {
 	typeKind := Deref(fieldType).Kind()
 	valueKind := reflect.TypeOf(mapValue).Kind()
 
-	switch {
-	case typeKind == reflect.Slice && valueKind == reflect.Slice:
-		return u.fillSlice(fieldType, value, mapValue)
-	case typeKind == reflect.Map && valueKind == reflect.Map:
-		return u.fillMap(field, value, mapValue)
+	switch v := mapValue.(type) {
+	case json.Number:
+		return u.processFieldPrimitiveWithJSONNumber(fieldType, value, v, opts, fullName)
 	default:
-		switch v := mapValue.(type) {
-		case json.Number:
-			return u.processFieldPrimitiveWithJsonNumber(field, value, v, opts, fullName)
-		default:
-			if typeKind == valueKind {
-				if err := validateValueInOptions(opts.options(), mapValue); err != nil {
-					return err
-				}
-
-				return fillWithSameType(field, value, mapValue, opts)
+		if typeKind == valueKind {
+			if err := validateValueInOptions(mapValue, opts.options()); err != nil {
+				return err
 			}
+
+			return fillWithSameType(fieldType, value, mapValue, opts)
 		}
 	}
 
 	return newTypeMismatchError(fullName)
 }
 
-func (u *Unmarshaler) processFieldPrimitiveWithJsonNumber(field reflect.StructField, value reflect.Value,
+func (u *Unmarshaler) processFieldPrimitiveWithJSONNumber(fieldType reflect.Type, value reflect.Value,
 	v json.Number, opts *fieldOptionsWithContext, fullName string) error {
-	fieldType := field.Type
-	fieldKind := fieldType.Kind()
-	typeKind := Deref(fieldType).Kind()
+	baseType := Deref(fieldType)
+	typeKind := baseType.Kind()
 
 	if err := validateJsonNumberRange(v, opts); err != nil {
 		return err
 	}
 
-	if fieldKind == reflect.Ptr {
-		value = value.Elem()
+	if err := validateValueInOptions(v, opts.options()); err != nil {
+		return err
 	}
 
+	target := reflect.New(Deref(fieldType)).Elem()
+
 	switch typeKind {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		iValue, err := v.Int64()
-		if err != nil {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if err := setValueFromString(typeKind, target, v.String()); err != nil {
 			return err
 		}
-
-		value.SetInt(iValue)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		iValue, err := v.Int64()
-		if err != nil {
-			return err
-		}
-
-		value.SetUint(uint64(iValue))
-	case reflect.Float32, reflect.Float64:
+	case reflect.Float32:
 		fValue, err := v.Float64()
 		if err != nil {
 			return err
 		}
 
-		value.SetFloat(fValue)
+		// if the value is a pointer, we need to check overflow with the pointer's value.
+		derefedValue := value
+		for derefedValue.Type().Kind() == reflect.Ptr {
+			derefedValue = derefedValue.Elem()
+		}
+		if derefedValue.CanFloat() && derefedValue.OverflowFloat(fValue) {
+			return fmt.Errorf("parsing %q as float32: value out of range", v.String())
+		}
+
+		target.SetFloat(fValue)
+	case reflect.Float64:
+		fValue, err := v.Float64()
+		if err != nil {
+			return err
+		}
+
+		target.SetFloat(fValue)
 	default:
-		return newTypeMismatchError(fullName)
+		return newTypeMismatchErrorWithHint(fullName, typeKind.String(), numberTypeString)
 	}
+
+	SetValue(fieldType, value, target)
 
 	return nil
 }
 
-func (u *Unmarshaler) processFieldStruct(field reflect.StructField, value reflect.Value,
-	mapValue interface{}, fullName string) error {
-	convertedValue, ok := mapValue.(map[string]interface{})
-	if !ok {
-		valueKind := reflect.TypeOf(mapValue).Kind()
-		return fmt.Errorf("error: field: %s, expect map[string]interface{}, actual %v", fullName, valueKind)
-	}
-
-	return u.processFieldStructWithMap(field, value, MapValuer(convertedValue), fullName)
-}
-
-func (u *Unmarshaler) processFieldStructWithMap(field reflect.StructField, value reflect.Value,
-	m Valuer, fullName string) error {
-	if field.Type.Kind() == reflect.Ptr {
-		baseType := Deref(field.Type)
+func (u *Unmarshaler) processFieldStruct(fieldType reflect.Type, value reflect.Value,
+	m valuerWithParent, fullName string) error {
+	if fieldType.Kind() == reflect.Ptr {
+		baseType := Deref(fieldType)
 		target := reflect.New(baseType).Elem()
 		if err := u.unmarshalWithFullName(m, target.Addr().Interface(), fullName); err != nil {
 			return err
 		}
 
-		value.Set(target.Addr())
+		SetValue(fieldType, value, target)
 	} else if err := u.unmarshalWithFullName(m, value.Addr().Interface(), fullName); err != nil {
 		return err
 	}
@@ -315,79 +712,207 @@ func (u *Unmarshaler) processFieldStructWithMap(field reflect.StructField, value
 	return nil
 }
 
+func (u *Unmarshaler) processFieldTextUnmarshaler(fieldType reflect.Type, value reflect.Value,
+	mapValue any) (bool, error) {
+	var tval encoding.TextUnmarshaler
+	var ok bool
+
+	if fieldType.Kind() == reflect.Ptr {
+		if value.Elem().Kind() == reflect.Ptr {
+			target := reflect.New(Deref(fieldType))
+			SetValue(fieldType.Elem(), value, target)
+			tval, ok = target.Interface().(encoding.TextUnmarshaler)
+		} else {
+			tval, ok = value.Interface().(encoding.TextUnmarshaler)
+		}
+	} else {
+		tval, ok = value.Addr().Interface().(encoding.TextUnmarshaler)
+	}
+	if ok {
+		switch mv := mapValue.(type) {
+		case string:
+			return true, tval.UnmarshalText([]byte(mv))
+		case []byte:
+			return true, tval.UnmarshalText(mv)
+		}
+	}
+
+	return false, nil
+}
+
+func (u *Unmarshaler) processFieldWithEnvValue(fieldType reflect.Type, value reflect.Value,
+	envVal string, opts *fieldOptionsWithContext, fullName string) error {
+	if err := validateValueInOptions(envVal, opts.options()); err != nil {
+		return err
+	}
+
+	fieldKind := fieldType.Kind()
+	switch fieldKind {
+	case reflect.Bool:
+		val, err := strconv.ParseBool(envVal)
+		if err != nil {
+			return fmt.Errorf("unmarshal field %q with environment variable, %w", fullName, err)
+		}
+
+		value.SetBool(val)
+		return nil
+	case durationType.Kind():
+		if err := fillDurationValue(fieldType, value, envVal); err != nil {
+			return fmt.Errorf("unmarshal field %q with environment variable, %w", fullName, err)
+		}
+
+		return nil
+	case reflect.String:
+		value.SetString(envVal)
+		return nil
+	default:
+		return u.processFieldPrimitiveWithJSONNumber(fieldType, value, json.Number(envVal), opts, fullName)
+	}
+}
+
 func (u *Unmarshaler) processNamedField(field reflect.StructField, value reflect.Value,
-	m Valuer, fullName string) error {
+	m valuerWithParent, fullName string) error {
+	if !field.IsExported() {
+		return nil
+	}
+
 	key, opts, err := u.parseOptionsWithContext(field, m, fullName)
 	if err != nil {
 		return err
 	}
 
-	fullName = join(fullName, key)
-	mapValue, hasValue := getValue(m, key)
-	if hasValue {
-		return u.processNamedFieldWithValue(field, value, mapValue, key, opts, fullName)
+	if key == ignoreKey {
+		return nil
 	}
 
-	return u.processNamedFieldWithoutValue(field, value, opts, fullName)
+	fullName = join(fullName, key)
+	if opts != nil && len(opts.EnvVar) > 0 {
+		envVal := proc.Env(opts.EnvVar)
+		if len(envVal) > 0 {
+			return u.processFieldWithEnvValue(field.Type, value, envVal, opts, fullName)
+		}
+	}
+
+	canonicalKey := key
+	if u.opts.canonicalKey != nil {
+		canonicalKey = u.opts.canonicalKey(key)
+	}
+
+	valuer := createValuer(m, opts)
+	mapValue, hasValue := getValue(valuer, canonicalKey, u.opts.opaqueKeys)
+
+	// When fillDefault is used, m is a null value, hasValue must be false, all priority judgments fillDefault.
+	if u.opts.fillDefault {
+		if !value.IsZero() {
+			return fmt.Errorf("set the default value, %q must be zero", fullName)
+		}
+		return u.processNamedFieldWithoutValue(field.Type, value, opts, fullName)
+	} else if !hasValue {
+		return u.processNamedFieldWithoutValue(field.Type, value, opts, fullName)
+	}
+
+	return u.processNamedFieldWithValue(field.Type, value, valueWithParent{
+		value:  mapValue,
+		parent: valuer,
+	}, key, opts, fullName)
 }
 
-func (u *Unmarshaler) processNamedFieldWithValue(field reflect.StructField, value reflect.Value,
-	mapValue interface{}, key string, opts *fieldOptionsWithContext, fullName string) error {
+func (u *Unmarshaler) processNamedFieldWithValue(fieldType reflect.Type, value reflect.Value,
+	vp valueWithParent, key string, opts *fieldOptionsWithContext, fullName string) error {
+	mapValue := vp.value
 	if mapValue == nil {
 		if opts.optional() {
 			return nil
 		}
 
-		return fmt.Errorf("field %s mustn't be nil", key)
+		return fmt.Errorf("field %q mustn't be nil", key)
 	}
 
-	maybeNewValue(field, value)
+	if !value.CanSet() {
+		return fmt.Errorf("field %q is not settable", key)
+	}
 
-	fieldKind := Deref(field.Type).Kind()
+	maybeNewValue(fieldType, value)
+
+	if yes, err := u.processFieldTextUnmarshaler(fieldType, value, mapValue); yes {
+		return err
+	}
+
+	fieldKind := Deref(fieldType).Kind()
 	switch fieldKind {
 	case reflect.Array, reflect.Map, reflect.Slice, reflect.Struct:
-		return u.processFieldNotFromString(field, value, mapValue, opts, fullName)
+		return u.processFieldNotFromString(fieldType, value, vp, opts, fullName)
 	default:
 		if u.opts.fromString || opts.fromString() {
-			valueKind := reflect.TypeOf(mapValue).Kind()
-			if valueKind != reflect.String {
-				return fmt.Errorf("error: the value in map is not string, but %s", valueKind)
-			}
-
-			options := opts.options()
-			if len(options) > 0 {
-				if !stringx.Contains(options, mapValue.(string)) {
-					return fmt.Errorf(`error: value "%s" for field "%s" is not defined in options "%v"`,
-						mapValue, key, options)
-				}
-			}
-
-			return fillPrimitive(field.Type, value, mapValue, opts, fullName)
+			return u.processNamedFieldWithValueFromString(fieldType, value, mapValue,
+				key, opts, fullName)
 		}
 
-		return u.processFieldNotFromString(field, value, mapValue, opts, fullName)
+		return u.processFieldNotFromString(fieldType, value, vp, opts, fullName)
 	}
 }
 
-func (u *Unmarshaler) processNamedFieldWithoutValue(field reflect.StructField, value reflect.Value,
+func (u *Unmarshaler) processNamedFieldWithValueFromString(fieldType reflect.Type, value reflect.Value,
+	mapValue any, key string, opts *fieldOptionsWithContext, fullName string) error {
+	valueKind := reflect.TypeOf(mapValue).Kind()
+	if valueKind != reflect.String {
+		return fmt.Errorf("the value in map is not string, but %s", valueKind)
+	}
+
+	options := opts.options()
+	if len(options) > 0 {
+		var checkValue string
+		switch mt := mapValue.(type) {
+		case string:
+			checkValue = mt
+		case fmt.Stringer:
+			checkValue = mt.String()
+		default:
+			return fmt.Errorf("the value in map is not string or json.Number, but %s",
+				valueKind.String())
+		}
+
+		if !stringx.Contains(options, checkValue) {
+			return fmt.Errorf(`value "%s" for field %q is not defined in options "%v"`,
+				mapValue, key, options)
+		}
+	}
+
+	return fillPrimitive(fieldType, value, mapValue, opts, fullName)
+}
+
+func (u *Unmarshaler) processNamedFieldWithoutValue(fieldType reflect.Type, value reflect.Value,
 	opts *fieldOptionsWithContext, fullName string) error {
-	derefedType := Deref(field.Type)
+	derefedType := Deref(fieldType)
 	fieldKind := derefedType.Kind()
 	if defaultValue, ok := opts.getDefault(); ok {
-		if field.Type.Kind() == reflect.Ptr {
-			maybeNewValue(field, value)
-			value = value.Elem()
-		}
 		if derefedType == durationType {
-			return fillDurationValue(fieldKind, value, defaultValue)
+			return fillDurationValue(fieldType, value, defaultValue)
 		}
-		return setValue(fieldKind, value, defaultValue)
+
+		switch fieldKind {
+		case reflect.Array, reflect.Slice:
+			return u.fillSliceWithDefault(derefedType, value, defaultValue, fullName)
+		default:
+			return setValueFromString(fieldKind, value, defaultValue)
+		}
+	}
+
+	if u.opts.fillDefault {
+		if fieldType.Kind() != reflect.Ptr && fieldKind == reflect.Struct {
+			return u.processFieldNotFromString(fieldType, value, valueWithParent{
+				value: emptyMap,
+			}, opts, fullName)
+		}
+		return nil
 	}
 
 	switch fieldKind {
 	case reflect.Array, reflect.Map, reflect.Slice:
 		if !opts.optional() {
-			return u.processFieldNotFromString(field, value, emptyMap, opts, fullName)
+			return u.processFieldNotFromString(fieldType, value, valueWithParent{
+				value: emptyMap,
+			}, opts, fullName)
 		}
 	case reflect.Struct:
 		if !opts.optional() {
@@ -395,10 +920,14 @@ func (u *Unmarshaler) processNamedFieldWithoutValue(field reflect.StructField, v
 			if err != nil {
 				return err
 			}
+
 			if required {
 				return fmt.Errorf("%q is not set", fullName)
 			}
-			return u.processFieldNotFromString(field, value, emptyMap, opts, fullName)
+
+			return u.processFieldNotFromString(fieldType, value, valueWithParent{
+				value: emptyMap,
+			}, opts, fullName)
 		}
 	default:
 		if !opts.optional() {
@@ -409,234 +938,92 @@ func (u *Unmarshaler) processNamedFieldWithoutValue(field reflect.StructField, v
 	return nil
 }
 
-func (u *Unmarshaler) fillMap(field reflect.StructField, value reflect.Value, mapValue interface{}) error {
-	if !value.CanSet() {
-		return errValueNotSettable
-	}
-
-	fieldKeyType := field.Type.Key()
-	fieldElemType := field.Type.Elem()
-	targetValue, err := u.generateMap(fieldKeyType, fieldElemType, mapValue)
-	if err != nil {
+func (u *Unmarshaler) unmarshalWithFullName(m valuerWithParent, v any, fullName string) error {
+	rv := reflect.ValueOf(v)
+	if err := ValidatePtr(rv); err != nil {
 		return err
 	}
 
-	value.Set(targetValue)
-	return nil
-}
-
-func (u *Unmarshaler) fillSlice(fieldType reflect.Type, value reflect.Value, mapValue interface{}) error {
-	if !value.CanSet() {
-		return errValueNotSettable
+	valueType := reflect.TypeOf(v)
+	baseType := Deref(valueType)
+	if baseType.Kind() != reflect.Struct {
+		return errValueNotStruct
 	}
 
-	baseType := fieldType.Elem()
-	baseKind := baseType.Kind()
-	dereffedBaseType := Deref(baseType)
-	dereffedBaseKind := dereffedBaseType.Kind()
-	refValue := reflect.ValueOf(mapValue)
-	conv := reflect.MakeSlice(reflect.SliceOf(baseType), refValue.Len(), refValue.Cap())
-
-	var valid bool
-	for i := 0; i < refValue.Len(); i++ {
-		ithValue := refValue.Index(i).Interface()
-		if ithValue == nil {
-			continue
-		}
-
-		valid = true
-		switch dereffedBaseKind {
-		case reflect.Struct:
-			target := reflect.New(dereffedBaseType)
-			if err := u.Unmarshal(ithValue.(map[string]interface{}), target.Interface()); err != nil {
-				return err
-			}
-
-			if baseKind == reflect.Ptr {
-				conv.Index(i).Set(target)
-			} else {
-				conv.Index(i).Set(target.Elem())
-			}
-		case reflect.Slice:
-			if err := u.fillSlice(dereffedBaseType, conv.Index(i), ithValue); err != nil {
-				return err
-			}
-		default:
-			if err := u.fillSliceValue(conv, i, dereffedBaseKind, ithValue); err != nil {
-				return err
-			}
-		}
+	valElem := rv.Elem()
+	if valElem.Kind() == reflect.Ptr {
+		target := reflect.New(baseType).Elem()
+		SetValue(valueType.Elem(), valElem, target)
+		valElem = target
 	}
 
-	if valid {
-		value.Set(conv)
-	}
-
-	return nil
-}
-
-func (u *Unmarshaler) fillSliceFromString(fieldType reflect.Type, value reflect.Value, mapValue interface{}) error {
-	var slice []interface{}
-	if err := jsonx.UnmarshalFromString(mapValue.(string), &slice); err != nil {
-		return err
-	}
-
-	baseFieldType := Deref(fieldType.Elem())
-	baseFieldKind := baseFieldType.Kind()
-	conv := reflect.MakeSlice(reflect.SliceOf(baseFieldType), len(slice), cap(slice))
-
-	for i := 0; i < len(slice); i++ {
-		if err := u.fillSliceValue(conv, i, baseFieldKind, slice[i]); err != nil {
+	numFields := baseType.NumField()
+	for i := 0; i < numFields; i++ {
+		typeField := baseType.Field(i)
+		valueField := valElem.Field(i)
+		if err := u.processField(typeField, valueField, m, fullName); err != nil {
 			return err
 		}
 	}
 
-	value.Set(conv)
 	return nil
 }
 
-func (u *Unmarshaler) fillSliceValue(slice reflect.Value, index int, baseKind reflect.Kind, value interface{}) error {
-	ithVal := slice.Index(index)
-	switch v := value.(type) {
-	case json.Number:
-		return setValue(baseKind, ithVal, v.String())
-	default:
-		// don't need to consider the difference between int, int8, int16, int32, int64,
-		// uint, uint8, uint16, uint32, uint64, because they're handled as json.Number.
-		if ithVal.Kind() == reflect.Ptr {
-			baseType := Deref(ithVal.Type())
-			if baseType.Kind() != reflect.TypeOf(value).Kind() {
-				return errTypeMismatch
-			}
-
-			target := reflect.New(baseType).Elem()
-			target.Set(reflect.ValueOf(value))
-			ithVal.Set(target.Addr())
-			return nil
-		} else {
-			if ithVal.Kind() != reflect.TypeOf(value).Kind() {
-				return errTypeMismatch
-			}
-
-			ithVal.Set(reflect.ValueOf(value))
-			return nil
-		}
-	}
-}
-
-func (u *Unmarshaler) generateMap(keyType, elemType reflect.Type, mapValue interface{}) (reflect.Value, error) {
-	mapType := reflect.MapOf(keyType, elemType)
-	valueType := reflect.TypeOf(mapValue)
-	if mapType == valueType {
-		return reflect.ValueOf(mapValue), nil
-	}
-
-	refValue := reflect.ValueOf(mapValue)
-	targetValue := reflect.MakeMapWithSize(mapType, refValue.Len())
-	fieldElemKind := elemType.Kind()
-	dereffedElemType := Deref(elemType)
-	dereffedElemKind := dereffedElemType.Kind()
-
-	for _, key := range refValue.MapKeys() {
-		keythValue := refValue.MapIndex(key)
-		keythData := keythValue.Interface()
-
-		switch dereffedElemKind {
-		case reflect.Slice:
-			target := reflect.New(dereffedElemType)
-			if err := u.fillSlice(elemType, target.Elem(), keythData); err != nil {
-				return emptyValue, err
-			}
-
-			targetValue.SetMapIndex(key, target.Elem())
-		case reflect.Struct:
-			keythMap, ok := keythData.(map[string]interface{})
-			if !ok {
-				return emptyValue, errTypeMismatch
-			}
-
-			target := reflect.New(dereffedElemType)
-			if err := u.Unmarshal(keythMap, target.Interface()); err != nil {
-				return emptyValue, err
-			}
-
-			if fieldElemKind == reflect.Ptr {
-				targetValue.SetMapIndex(key, target)
-			} else {
-				targetValue.SetMapIndex(key, target.Elem())
-			}
-		case reflect.Map:
-			keythMap, ok := keythData.(map[string]interface{})
-			if !ok {
-				return emptyValue, errTypeMismatch
-			}
-
-			innerValue, err := u.generateMap(elemType.Key(), elemType.Elem(), keythMap)
-			if err != nil {
-				return emptyValue, err
-			}
-
-			targetValue.SetMapIndex(key, innerValue)
-		default:
-			switch v := keythData.(type) {
-			case string:
-				targetValue.SetMapIndex(key, reflect.ValueOf(v))
-			case json.Number:
-				target := reflect.New(dereffedElemType)
-				if err := setValue(dereffedElemKind, target.Elem(), v.String()); err != nil {
-					return emptyValue, err
-				}
-
-				targetValue.SetMapIndex(key, target.Elem())
-			default:
-				targetValue.SetMapIndex(key, keythValue)
-			}
-		}
-	}
-
-	return targetValue, nil
-}
-
-func (u *Unmarshaler) parseOptionsWithContext(field reflect.StructField, m Valuer, fullName string) (
-	string, *fieldOptionsWithContext, error) {
-	key, options, err := parseKeyAndOptions(u.key, field)
-	if err != nil {
-		return "", nil, err
-	} else if options == nil {
-		return key, nil, nil
-	}
-
-	optsWithContext, err := options.toOptionsWithContext(key, m, fullName)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return key, optsWithContext, nil
-}
-
-// WithStringValues customizes a Unmarshaler with number values from strings.
+// WithStringValues customizes an Unmarshaler with number values from strings.
 func WithStringValues() UnmarshalOption {
 	return func(opt *unmarshalOptions) {
 		opt.fromString = true
 	}
 }
 
-func fillDurationValue(fieldKind reflect.Kind, value reflect.Value, dur string) error {
+// WithCanonicalKeyFunc customizes an Unmarshaler with Canonical Key func.
+func WithCanonicalKeyFunc(f func(string) string) UnmarshalOption {
+	return func(opt *unmarshalOptions) {
+		opt.canonicalKey = f
+	}
+}
+
+// WithDefault customizes an Unmarshaler with fill default values.
+func WithDefault() UnmarshalOption {
+	return func(opt *unmarshalOptions) {
+		opt.fillDefault = true
+	}
+}
+
+// WithOpaqueKeys customizes an Unmarshaler with opaque keys.
+// Opaque keys are keys that are not processed by the unmarshaler.
+func WithOpaqueKeys() UnmarshalOption {
+	return func(opt *unmarshalOptions) {
+		opt.opaqueKeys = true
+	}
+}
+
+func createValuer(v valuerWithParent, opts *fieldOptionsWithContext) valuerWithParent {
+	if opts.inherit() {
+		return recursiveValuer{
+			current: v,
+			parent:  v.Parent(),
+		}
+	}
+
+	return simpleValuer{
+		current: v,
+		parent:  v.Parent(),
+	}
+}
+
+func fillDurationValue(fieldType reflect.Type, value reflect.Value, dur string) error {
 	d, err := time.ParseDuration(dur)
 	if err != nil {
 		return err
 	}
 
-	if fieldKind == reflect.Ptr {
-		value.Elem().Set(reflect.ValueOf(d))
-	} else {
-		value.Set(reflect.ValueOf(d))
-	}
+	SetValue(fieldType, value, reflect.ValueOf(d))
 
 	return nil
 }
 
-func fillPrimitive(fieldType reflect.Type, value reflect.Value, mapValue interface{},
+func fillPrimitive(fieldType reflect.Type, value reflect.Value, mapValue any,
 	opts *fieldOptionsWithContext, fullName string) error {
 	if !value.CanSet() {
 		return errValueNotSettable
@@ -647,7 +1034,7 @@ func fillPrimitive(fieldType reflect.Type, value reflect.Value, mapValue interfa
 		target := reflect.New(baseType).Elem()
 		switch mapValue.(type) {
 		case string, json.Number:
-			value.Set(target.Addr())
+			SetValue(fieldType, value, target)
 			value = target
 		}
 	}
@@ -659,13 +1046,13 @@ func fillPrimitive(fieldType reflect.Type, value reflect.Value, mapValue interfa
 		if err := validateJsonNumberRange(v, opts); err != nil {
 			return err
 		}
-		return setValue(baseType.Kind(), value, v.String())
+		return setValueFromString(baseType.Kind(), value, v.String())
 	default:
 		return newTypeMismatchError(fullName)
 	}
 }
 
-func fillWithSameType(field reflect.StructField, value reflect.Value, mapValue interface{},
+func fillWithSameType(fieldType reflect.Type, value reflect.Value, mapValue any,
 	opts *fieldOptionsWithContext) error {
 	if !value.CanSet() {
 		return errValueNotSettable
@@ -675,51 +1062,43 @@ func fillWithSameType(field reflect.StructField, value reflect.Value, mapValue i
 		return err
 	}
 
-	if field.Type.Kind() == reflect.Ptr {
-		baseType := Deref(field.Type)
+	if fieldType.Kind() == reflect.Ptr {
+		baseType := Deref(fieldType)
 		target := reflect.New(baseType).Elem()
-		target.Set(reflect.ValueOf(mapValue))
-		value.Set(target.Addr())
+		setSameKindValue(baseType, target, mapValue)
+		SetValue(fieldType, value, target)
 	} else {
-		value.Set(reflect.ValueOf(mapValue))
+		setSameKindValue(fieldType, value, mapValue)
 	}
 
 	return nil
 }
 
 // getValue gets the value for the specific key, the key can be in the format of parentKey.childKey
-func getValue(m Valuer, key string) (interface{}, bool) {
-	keys := readKeys(key)
+func getValue(m valuerWithParent, key string, opaque bool) (any, bool) {
+	keys := readKeys(key, opaque)
 	return getValueWithChainedKeys(m, keys)
 }
 
-func getValueWithChainedKeys(m Valuer, keys []string) (interface{}, bool) {
-	if len(keys) == 1 {
+func getValueWithChainedKeys(m valuerWithParent, keys []string) (any, bool) {
+	switch len(keys) {
+	case 0:
+		return nil, false
+	case 1:
 		v, ok := m.Value(keys[0])
 		return v, ok
-	} else if len(keys) > 1 {
+	default:
 		if v, ok := m.Value(keys[0]); ok {
-			if nextm, ok := v.(map[string]interface{}); ok {
-				return getValueWithChainedKeys(MapValuer(nextm), keys[1:])
+			if nextm, ok := v.(map[string]any); ok {
+				return getValueWithChainedKeys(recursiveValuer{
+					current: mapValuer(nextm),
+					parent:  m,
+				}, keys[1:])
 			}
 		}
+
+		return nil, false
 	}
-
-	return nil, false
-}
-
-func insertKeys(key string, cache []string) {
-	cacheKeysLock.Lock()
-	defer cacheKeysLock.Unlock()
-
-	keys := cacheKeys.Load().(keyCache)
-	// copy the contents into the new map, to guarantee the old map is immutable
-	newKeys := make(keyCache)
-	for k, v := range keys {
-		newKeys[k] = v
-	}
-	newKeys[key] = cache
-	cacheKeys.Store(newKeys)
 }
 
 func join(elem ...string) string {
@@ -744,23 +1123,44 @@ func join(elem ...string) string {
 }
 
 func newInitError(name string) error {
-	return fmt.Errorf("field %s is not set", name)
+	return fmt.Errorf("field %q is not set", name)
 }
 
 func newTypeMismatchError(name string) error {
-	return fmt.Errorf("error: type mismatch for field %s", name)
+	return fmt.Errorf("type mismatch for field %q", name)
 }
 
-func readKeys(key string) []string {
-	cache := cacheKeys.Load().(keyCache)
-	if keys, ok := cache[key]; ok {
+func newTypeMismatchErrorWithHint(name, expectType, actualType string) error {
+	return fmt.Errorf("type mismatch for field %q, expect %q, actual %q",
+		name, expectType, actualType)
+}
+
+func readKeys(key string, opaque bool) []string {
+	if opaque {
+		return []string{key}
+	}
+
+	cacheKeysLock.Lock()
+	keys, ok := cacheKeys[key]
+	cacheKeysLock.Unlock()
+	if ok {
 		return keys
 	}
 
-	keys := strings.FieldsFunc(key, func(c rune) bool {
+	keys = strings.FieldsFunc(key, func(c rune) bool {
 		return c == delimiter
 	})
-	insertKeys(key, keys)
+	cacheKeysLock.Lock()
+	cacheKeys[key] = keys
+	cacheKeysLock.Unlock()
 
 	return keys
+}
+
+func setSameKindValue(targetType reflect.Type, target reflect.Value, value any) {
+	if reflect.ValueOf(value).Type().AssignableTo(targetType) {
+		target.Set(reflect.ValueOf(value))
+	} else {
+		target.Set(reflect.ValueOf(value).Convert(targetType))
+	}
 }

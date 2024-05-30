@@ -11,26 +11,54 @@ import (
 	"sync"
 	"time"
 
-	"github.com/logrusorgru/aurora"
-	"github.com/tal-tech/go-zero/core/logx"
-	apiformat "github.com/tal-tech/go-zero/tools/goctl/api/format"
-	"github.com/tal-tech/go-zero/tools/goctl/api/parser"
-	apiutil "github.com/tal-tech/go-zero/tools/goctl/api/util"
-	"github.com/tal-tech/go-zero/tools/goctl/config"
-	"github.com/tal-tech/go-zero/tools/goctl/util"
-	"github.com/urfave/cli"
+	"github.com/gookit/color"
+	"github.com/spf13/cobra"
+	"github.com/zeromicro/go-zero/core/logx"
+	apiformat "github.com/zeromicro/go-zero/tools/goctl/api/format"
+	"github.com/zeromicro/go-zero/tools/goctl/api/parser"
+	apiutil "github.com/zeromicro/go-zero/tools/goctl/api/util"
+	"github.com/zeromicro/go-zero/tools/goctl/config"
+	"github.com/zeromicro/go-zero/tools/goctl/pkg/golang"
+	"github.com/zeromicro/go-zero/tools/goctl/util"
+	"github.com/zeromicro/go-zero/tools/goctl/util/pathx"
 )
 
 const tmpFile = "%s-%d"
 
-var tmpDir = path.Join(os.TempDir(), "goctl")
+var (
+	tmpDir = path.Join(os.TempDir(), "goctl")
+	// VarStringDir describes the directory.
+	VarStringDir string
+	// VarStringAPI describes the API.
+	VarStringAPI string
+	// VarStringHome describes the go home.
+	VarStringHome string
+	// VarStringRemote describes the remote git repository.
+	VarStringRemote string
+	// VarStringBranch describes the branch.
+	VarStringBranch string
+	// VarStringStyle describes the style of output files.
+	VarStringStyle string
+)
 
 // GoCommand gen go project files from command line
-func GoCommand(c *cli.Context) error {
-	apiFile := c.String("api")
-	dir := c.String("dir")
-	namingStyle := c.String("style")
+func GoCommand(_ *cobra.Command, _ []string) error {
+	apiFile := VarStringAPI
+	dir := VarStringDir
+	namingStyle := VarStringStyle
+	home := VarStringHome
+	remote := VarStringRemote
+	branch := VarStringBranch
+	if len(remote) > 0 {
+		repo, _ := util.CloneIntoGitHome(remote, branch)
+		if len(repo) > 0 {
+			home = repo
+		}
+	}
 
+	if len(home) > 0 {
+		pathx.RegisterGoctlHome(home)
+	}
 	if len(apiFile) == 0 {
 		return errors.New("missing -api")
 	}
@@ -48,13 +76,17 @@ func DoGenProject(apiFile, dir, style string) error {
 		return err
 	}
 
+	if err := api.Validate(); err != nil {
+		return err
+	}
+
 	cfg, err := config.NewConfig(style)
 	if err != nil {
 		return err
 	}
 
-	logx.Must(util.MkdirIfNotExist(dir))
-	rootPkg, err := getParentPackage(dir)
+	logx.Must(pathx.MkdirIfNotExist(dir))
+	rootPkg, err := golang.GetParentPackage(dir)
 	if err != nil {
 		return err
 	}
@@ -73,11 +105,11 @@ func DoGenProject(apiFile, dir, style string) error {
 		return err
 	}
 
-	if err := apiformat.ApiFormatByPath(apiFile); err != nil {
+	if err := apiformat.ApiFormatByPath(apiFile, false); err != nil {
 		return err
 	}
 
-	fmt.Println(aurora.Green("Done."))
+	fmt.Println(color.Green.Render("Done."))
 	return nil
 }
 
@@ -120,14 +152,14 @@ func sweep() error {
 			seconds, err := strconv.ParseInt(timestamp, 10, 64)
 			if err != nil {
 				// print error and ignore
-				fmt.Println(aurora.Red(fmt.Sprintf("sweep ignored file: %s", fpath)))
+				fmt.Println(color.Red.Sprintf("sweep ignored file: %s", fpath))
 				return nil
 			}
 
 			tm := time.Unix(seconds, 0)
 			if tm.Before(keepTime) {
-				if err := os.Remove(fpath); err != nil {
-					fmt.Println(aurora.Red(fmt.Sprintf("failed to remove file: %s", fpath)))
+				if err := os.RemoveAll(fpath); err != nil {
+					fmt.Println(color.Red.Sprintf("failed to remove file: %s", fpath))
 					return err
 				}
 			}

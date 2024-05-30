@@ -1,5 +1,8 @@
 package spec
 
+// RoutePrefixKey is the prefix keyword for the routes.
+const RoutePrefixKey = "prefix"
+
 type (
 	// Doc describes document
 	Doc []string
@@ -16,11 +19,11 @@ type (
 		Comment Doc
 	}
 
-	// ApiSpec describes a api file
+	// ApiSpec describes an api file
 	ApiSpec struct {
-		Info    Info
-		Syntax  ApiSyntax
-		Imports []Import
+		Info    Info      // Deprecated: useless expression
+		Syntax  ApiSyntax // Deprecated: useless expression
+		Imports []Import  // Deprecated: useless expression
 		Types   []Type
 		Service Service
 	}
@@ -67,6 +70,7 @@ type (
 
 	// Route describes api route
 	Route struct {
+		// Deprecated: Use Service AtServer instead.
 		AtServerAnnotation Annotation
 		Method             string
 		Path               string
@@ -126,7 +130,7 @@ type (
 		Value   Type
 	}
 
-	// InterfaceType describes a interface for api
+	// InterfaceType describes an interface for api
 	InterfaceType struct {
 		RawName string
 	}

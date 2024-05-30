@@ -7,37 +7,41 @@ import (
 	"google.golang.org/grpc"
 )
 
+// TimeoutCallOption is a call option that controls timeout.
+type TimeoutCallOption struct {
+	grpc.EmptyCallOption
+	timeout time.Duration
+}
+
 // TimeoutInterceptor is an interceptor that controls timeout.
 func TimeoutInterceptor(timeout time.Duration) grpc.UnaryClientInterceptor {
-	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn,
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn,
 		invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		if timeout <= 0 {
+		t := getTimeoutFromCallOptions(opts, timeout)
+		if t <= 0 {
 			return invoker(ctx, method, req, reply, cc, opts...)
 		}
 
-		ctx, cancel := context.WithTimeout(ctx, timeout)
+		ctx, cancel := context.WithTimeout(ctx, t)
 		defer cancel()
 
-		// create channel with buffer size 1 to avoid goroutine leak
-		done := make(chan error, 1)
-		panicChan := make(chan interface{}, 1)
-		go func() {
-			defer func() {
-				if p := recover(); p != nil {
-					panicChan <- p
-				}
-			}()
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
 
-			done <- invoker(ctx, method, req, reply, cc, opts...)
-		}()
+// WithCallTimeout returns a call option that controls method call timeout.
+func WithCallTimeout(timeout time.Duration) grpc.CallOption {
+	return TimeoutCallOption{
+		timeout: timeout,
+	}
+}
 
-		select {
-		case p := <-panicChan:
-			panic(p)
-		case err := <-done:
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
+func getTimeoutFromCallOptions(opts []grpc.CallOption, defaultTimeout time.Duration) time.Duration {
+	for _, opt := range opts {
+		if o, ok := opt.(TimeoutCallOption); ok {
+			return o.timeout
 		}
 	}
+
+	return defaultTimeout
 }

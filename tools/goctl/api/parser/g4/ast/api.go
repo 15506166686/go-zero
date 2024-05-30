@@ -2,9 +2,15 @@ package ast
 
 import (
 	"fmt"
+	"path"
 	"sort"
 
-	"github.com/tal-tech/go-zero/tools/goctl/api/parser/g4/gen/api"
+	"github.com/zeromicro/go-zero/tools/goctl/api/parser/g4/gen/api"
+)
+
+const (
+	prefixKey = "prefix"
+	groupKey  = "group"
 )
 
 // Api describes syntax for api
@@ -23,7 +29,7 @@ type Api struct {
 }
 
 // VisitApi implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitApi(ctx *api.ApiContext) interface{} {
+func (v *ApiVisitor) VisitApi(ctx *api.ApiContext) any {
 	var final Api
 	final.importM = map[string]PlaceHolder{}
 	final.typeM = map[string]PlaceHolder{}
@@ -45,12 +51,23 @@ func (v *ApiVisitor) VisitApi(ctx *api.ApiContext) interface{} {
 func (v *ApiVisitor) acceptService(root, final *Api) {
 	for _, service := range root.Service {
 		if _, ok := final.serviceM[service.ServiceApi.Name.Text()]; !ok && len(final.serviceM) > 0 {
-			v.panic(service.ServiceApi.Name, fmt.Sprintf("mutiple service declaration"))
+			v.panic(service.ServiceApi.Name, "multiple service declaration")
 		}
 		v.duplicateServerItemCheck(service)
 
+		var prefix, group string
+		if service.AtServer != nil {
+			p := service.AtServer.Kv.Get(prefixKey)
+			if p != nil {
+				prefix = p.Text()
+			}
+			g := service.AtServer.Kv.Get(groupKey)
+			if g != nil {
+				group = g.Text()
+			}
+		}
 		for _, route := range service.ServiceApi.ServiceRoute {
-			uniqueRoute := fmt.Sprintf("%s %s", route.Route.Method.Text(), route.Route.Path.Text())
+			uniqueRoute := fmt.Sprintf("%s %s", route.Route.Method.Text(), path.Join(prefix, route.Route.Path.Text()))
 			if _, ok := final.routeM[uniqueRoute]; ok {
 				v.panic(route.Route.Method, fmt.Sprintf("duplicate route '%s'", uniqueRoute))
 			}
@@ -75,17 +92,21 @@ func (v *ApiVisitor) acceptService(root, final *Api) {
 			}
 
 			if handlerExpr == nil {
-				v.panic(route.Route.Method, fmt.Sprintf("mismtached handler"))
+				v.panic(route.Route.Method, "mismatched handler")
 			}
 
 			if handlerExpr.Text() == "" {
-				v.panic(handlerExpr, fmt.Sprintf("mismtached handler"))
+				v.panic(handlerExpr, "mismatched handler")
 			}
 
-			if _, ok := final.handlerM[handlerExpr.Text()]; ok {
+			handlerKey := handlerExpr.Text()
+			if len(group) > 0 {
+				handlerKey = fmt.Sprintf("%s/%s", group, handlerExpr.Text())
+			}
+			if _, ok := final.handlerM[handlerKey]; ok {
 				v.panic(handlerExpr, fmt.Sprintf("duplicate handler '%s'", handlerExpr.Text()))
 			}
-			final.handlerM[handlerExpr.Text()] = Holder
+			final.handlerM[handlerKey] = Holder
 		}
 		final.Service = append(final.Service, service)
 	}
@@ -119,7 +140,7 @@ func (v *ApiVisitor) acceptInfo(root, final *Api) {
 	if root.Info != nil {
 		infoM := map[string]PlaceHolder{}
 		if final.Info != nil {
-			v.panic(root.Info.Info, fmt.Sprintf("mutiple info declaration"))
+			v.panic(root.Info.Info, "multiple info declaration")
 		}
 
 		for _, value := range root.Info.Kvs {
@@ -147,7 +168,7 @@ func (v *ApiVisitor) acceptImport(root, final *Api) {
 func (v *ApiVisitor) acceptSyntax(root, final *Api) {
 	if root.Syntax != nil {
 		if final.Syntax != nil {
-			v.panic(root.Syntax.Syntax, fmt.Sprintf("mutiple syntax declaration"))
+			v.panic(root.Syntax.Syntax, "multiple syntax declaration")
 		}
 
 		final.Syntax = root.Syntax
@@ -155,7 +176,7 @@ func (v *ApiVisitor) acceptSyntax(root, final *Api) {
 }
 
 // VisitSpec implements from api.BaseApiParserVisitor
-func (v *ApiVisitor) VisitSpec(ctx *api.SpecContext) interface{} {
+func (v *ApiVisitor) VisitSpec(ctx *api.SpecContext) any {
 	var root Api
 	if ctx.SyntaxLit() != nil {
 		root.Syntax = ctx.SyntaxLit().Accept(v).(*SyntaxExpr)
@@ -188,8 +209,8 @@ func (a *Api) Format() error {
 }
 
 // Equal compares whether the element literals in two Api are equal
-func (a *Api) Equal(v interface{}) bool {
-	if v == nil {
+func (a *Api) Equal(v any) bool {
+	if v == nil || a == nil {
 		return false
 	}
 

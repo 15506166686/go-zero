@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/tal-tech/go-zero/core/lang"
+	"github.com/zeromicro/go-zero/core/lang"
 )
 
 const limit = 10
@@ -17,10 +17,11 @@ func TestPoolGet(t *testing.T) {
 	ch := make(chan lang.PlaceholderType)
 
 	for i := 0; i < limit; i++ {
+		var fail AtomicBool
 		go func() {
 			v := stack.Get()
 			if v.(int) != 1 {
-				t.Fatal("unmatch value")
+				fail.Set(true)
 			}
 			ch <- lang.Placeholder
 		}()
@@ -29,6 +30,10 @@ func TestPoolGet(t *testing.T) {
 		case <-ch:
 		case <-time.After(time.Second):
 			t.Fail()
+		}
+
+		if fail.True() {
+			t.Fatal("unmatch value")
 		}
 	}
 }
@@ -70,7 +75,7 @@ func TestPoolPopTooMany(t *testing.T) {
 
 func TestPoolPopFirst(t *testing.T) {
 	var value int32
-	stack := NewPool(limit, func() interface{} {
+	stack := NewPool(limit, func() any {
 		return atomic.AddInt32(&value, 1)
 	}, destroy)
 
@@ -83,7 +88,7 @@ func TestPoolPopFirst(t *testing.T) {
 
 func TestPoolWithMaxAge(t *testing.T) {
 	var value int32
-	stack := NewPool(limit, func() interface{} {
+	stack := NewPool(limit, func() any {
 		return atomic.AddInt32(&value, 1)
 	}, destroy, WithMaxAge(time.Millisecond))
 
@@ -102,9 +107,9 @@ func TestNewPoolPanics(t *testing.T) {
 	})
 }
 
-func create() interface{} {
+func create() any {
 	return 1
 }
 
-func destroy(_ interface{}) {
+func destroy(_ any) {
 }

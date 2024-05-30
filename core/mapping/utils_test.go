@@ -15,7 +15,7 @@ type Foo struct {
 	StrWithTagAndOption string `key:"stringwithtag,string"`
 }
 
-func TestDeferInt(t *testing.T) {
+func TestDerefInt(t *testing.T) {
 	i := 1
 	s := "hello"
 	number := struct {
@@ -60,6 +60,51 @@ func TestDeferInt(t *testing.T) {
 	}
 }
 
+func TestDerefValInt(t *testing.T) {
+	i := 1
+	s := "hello"
+	number := struct {
+		f float64
+	}{
+		f: 6.4,
+	}
+	cases := []struct {
+		t      reflect.Value
+		expect reflect.Kind
+	}{
+		{
+			t:      reflect.ValueOf(i),
+			expect: reflect.Int,
+		},
+		{
+			t:      reflect.ValueOf(&i),
+			expect: reflect.Int,
+		},
+		{
+			t:      reflect.ValueOf(s),
+			expect: reflect.String,
+		},
+		{
+			t:      reflect.ValueOf(&s),
+			expect: reflect.String,
+		},
+		{
+			t:      reflect.ValueOf(number.f),
+			expect: reflect.Float64,
+		},
+		{
+			t:      reflect.ValueOf(&number.f),
+			expect: reflect.Float64,
+		},
+	}
+
+	for _, each := range cases {
+		t.Run(each.t.String(), func(t *testing.T) {
+			assert.Equal(t, each.expect, ensureValue(each.t).Kind())
+		})
+	}
+}
+
 func TestParseKeyAndOptionWithoutTag(t *testing.T) {
 	var foo Foo
 	rte := reflect.TypeOf(&foo).Elem()
@@ -90,33 +135,114 @@ func TestParseKeyAndOptionWithTagAndOption(t *testing.T) {
 	assert.True(t, options.FromString)
 }
 
+func TestParseSegments(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect []string
+	}{
+		{
+			input:  "",
+			expect: []string{},
+		},
+		{
+			input:  "   ",
+			expect: []string{},
+		},
+		{
+			input:  ",",
+			expect: []string{""},
+		},
+		{
+			input:  "foo,",
+			expect: []string{"foo"},
+		},
+		{
+			input: ",foo",
+			// the first empty string cannot be ignored, it's the key.
+			expect: []string{"", "foo"},
+		},
+		{
+			input:  "foo",
+			expect: []string{"foo"},
+		},
+		{
+			input:  "foo,bar",
+			expect: []string{"foo", "bar"},
+		},
+		{
+			input:  "foo,bar,baz",
+			expect: []string{"foo", "bar", "baz"},
+		},
+		{
+			input:  "foo,options=a|b",
+			expect: []string{"foo", "options=a|b"},
+		},
+		{
+			input:  "foo,bar,default=[baz,qux]",
+			expect: []string{"foo", "bar", "default=[baz,qux]"},
+		},
+		{
+			input:  "foo,bar,options=[baz,qux]",
+			expect: []string{"foo", "bar", "options=[baz,qux]"},
+		},
+		{
+			input:  `foo\,bar,options=[baz,qux]`,
+			expect: []string{`foo,bar`, "options=[baz,qux]"},
+		},
+		{
+			input:  `foo,bar,options=\[baz,qux]`,
+			expect: []string{"foo", "bar", "options=[baz", "qux]"},
+		},
+		{
+			input:  `foo,bar,options=[baz\,qux]`,
+			expect: []string{"foo", "bar", `options=[baz\,qux]`},
+		},
+		{
+			input:  `foo\,bar,options=[baz,qux],default=baz`,
+			expect: []string{`foo,bar`, "options=[baz,qux]", "default=baz"},
+		},
+		{
+			input:  `foo\,bar,options=[baz,qux, quux],default=[qux, baz]`,
+			expect: []string{`foo,bar`, "options=[baz,qux, quux]", "default=[qux, baz]"},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.input, func(t *testing.T) {
+			assert.ElementsMatch(t, test.expect, parseSegments(test.input))
+		})
+	}
+}
+
 func TestValidatePtrWithNonPtr(t *testing.T) {
 	var foo string
 	rve := reflect.ValueOf(foo)
-	assert.NotNil(t, ValidatePtr(&rve))
+	assert.NotNil(t, ValidatePtr(rve))
 }
 
 func TestValidatePtrWithPtr(t *testing.T) {
 	var foo string
 	rve := reflect.ValueOf(&foo)
-	assert.Nil(t, ValidatePtr(&rve))
+	assert.Nil(t, ValidatePtr(rve))
 }
 
 func TestValidatePtrWithNilPtr(t *testing.T) {
 	var foo *string
 	rve := reflect.ValueOf(foo)
-	assert.NotNil(t, ValidatePtr(&rve))
+	assert.NotNil(t, ValidatePtr(rve))
 }
 
 func TestValidatePtrWithZeroValue(t *testing.T) {
 	var s string
 	e := reflect.Zero(reflect.TypeOf(s))
-	assert.NotNil(t, ValidatePtr(&e))
+	assert.NotNil(t, ValidatePtr(e))
 }
 
 func TestSetValueNotSettable(t *testing.T) {
 	var i int
-	assert.NotNil(t, setValue(reflect.Int, reflect.ValueOf(i), "1"))
+	assert.Error(t, setValueFromString(reflect.Int, reflect.ValueOf(i), "1"))
+	assert.Error(t, validateAndSetValue(reflect.Int, reflect.ValueOf(i), "1", nil))
 }
 
 func TestParseKeyAndOptionsErrors(t *testing.T) {
@@ -137,7 +263,7 @@ func TestSetValueFormatErrors(t *testing.T) {
 		IntValue   int
 		UintValue  uint
 		FloatValue float32
-		MapValue   map[string]interface{}
+		MapValue   map[string]any
 	}
 
 	var bar Bar
@@ -169,127 +295,42 @@ func TestSetValueFormatErrors(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.kind.String(), func(t *testing.T) {
-			err := setValue(test.kind, test.target, test.value)
+			err := setValueFromString(test.kind, test.target, test.value)
 			assert.NotEqual(t, errValueNotSettable, err)
 			assert.NotNil(t, err)
 		})
 	}
 }
 
-func TestRepr(t *testing.T) {
-	var (
-		f32 float32 = 1.1
-		f64         = 2.2
-		i8  int8    = 1
-		i16 int16   = 2
-		i32 int32   = 3
-		i64 int64   = 4
-		u8  uint8   = 5
-		u16 uint16  = 6
-		u32 uint32  = 7
-		u64 uint64  = 8
-	)
-	tests := []struct {
-		v      interface{}
-		expect string
-	}{
-		{
-			nil,
-			"",
-		},
-		{
-			mockStringable{},
-			"mocked",
-		},
-		{
-			new(mockStringable),
-			"mocked",
-		},
-		{
-			newMockPtr(),
-			"mockptr",
-		},
-		{
-			true,
-			"true",
-		},
-		{
-			false,
-			"false",
-		},
-		{
-			f32,
-			"1.1",
-		},
-		{
-			f64,
-			"2.2",
-		},
-		{
-			i8,
-			"1",
-		},
-		{
-			i16,
-			"2",
-		},
-		{
-			i32,
-			"3",
-		},
-		{
-			i64,
-			"4",
-		},
-		{
-			u8,
-			"5",
-		},
-		{
-			u16,
-			"6",
-		},
-		{
-			u32,
-			"7",
-		},
-		{
-			u64,
-			"8",
-		},
-		{
-			[]byte(`abcd`),
-			"abcd",
-		},
-		{
-			mockOpacity{val: 1},
-			"{1}",
-		},
-	}
+func TestValidateValueRange(t *testing.T) {
+	t.Run("float", func(t *testing.T) {
+		assert.NoError(t, validateValueRange(1.2, nil))
+	})
 
-	for _, test := range tests {
-		t.Run(test.expect, func(t *testing.T) {
-			assert.Equal(t, test.expect, Repr(test.v))
-		})
-	}
+	t.Run("float number range", func(t *testing.T) {
+		assert.NoError(t, validateNumberRange(1.2, nil))
+	})
+
+	t.Run("bad float", func(t *testing.T) {
+		assert.Error(t, validateValueRange("a", &fieldOptionsWithContext{
+			Range: &numberRange{},
+		}))
+	})
+
+	t.Run("bad float validate", func(t *testing.T) {
+		var v struct {
+			Foo float32
+		}
+		assert.Error(t, validateAndSetValue(reflect.Int, reflect.ValueOf(&v).Elem().Field(0),
+			"1", &fieldOptionsWithContext{
+				Range: &numberRange{
+					left:  2,
+					right: 3,
+				},
+			}))
+	})
 }
 
-type mockStringable struct{}
-
-func (m mockStringable) String() string {
-	return "mocked"
-}
-
-type mockPtr struct{}
-
-func newMockPtr() *mockPtr {
-	return new(mockPtr)
-}
-
-func (m *mockPtr) String() string {
-	return "mockptr"
-}
-
-type mockOpacity struct {
-	val int
+func TestSetMatchedPrimitiveValue(t *testing.T) {
+	assert.Error(t, setMatchedPrimitiveValue(reflect.Func, reflect.ValueOf(2), "1"))
 }

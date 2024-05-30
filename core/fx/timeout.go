@@ -2,6 +2,9 @@ package fx
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -26,11 +29,12 @@ func DoWithTimeout(fn func() error, timeout time.Duration, opts ...DoOption) err
 
 	// create channel with buffer size 1 to avoid goroutine leak
 	done := make(chan error, 1)
-	panicChan := make(chan interface{}, 1)
+	panicChan := make(chan any, 1)
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				panicChan <- p
+				// attach call stack to avoid missing in different goroutine
+				panicChan <- fmt.Sprintf("%+v\n\n%s", p, strings.TrimSpace(string(debug.Stack())))
 			}
 		}()
 		done <- fn()

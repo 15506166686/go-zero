@@ -1,14 +1,17 @@
 package search
 
 import (
+	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/zeromicro/go-zero/core/stringx"
 )
 
 type mockedRoute struct {
 	route string
-	value int
+	value any
 }
 
 func TestSearch(t *testing.T) {
@@ -139,11 +142,9 @@ func TestStrictSearchSibling(t *testing.T) {
 		tree.Add(r.route, r.value)
 	}
 
-	for i := 0; i < 1000; i++ {
-		result, ok := tree.Search(query)
-		assert.True(t, ok)
-		assert.Equal(t, 3, result.Item.(int))
-	}
+	result, ok := tree.Search(query)
+	assert.True(t, ok)
+	assert.Equal(t, 3, result.Item.(int))
 }
 
 func TestAddDuplicate(t *testing.T) {
@@ -184,4 +185,48 @@ func TestSearchInvalidItem(t *testing.T) {
 	tree := NewTree()
 	err := tree.Add("/", nil)
 	assert.Equal(t, errEmptyItem, err)
+}
+
+func TestSearchInvalidState(t *testing.T) {
+	nd := newNode("0")
+	nd.children[0]["1"] = nil
+	assert.Error(t, add(nd, "1/2", "2"))
+}
+
+func BenchmarkSearchTree(b *testing.B) {
+	const (
+		avgLen  = 1000
+		entries = 10000
+	)
+
+	tree := NewTree()
+	generate := func() string {
+		var buf strings.Builder
+		size := rand.Intn(avgLen) + avgLen/2
+		val := stringx.Randn(size)
+		prev := 0
+		for j := rand.Intn(9) + 1; j < size; j += rand.Intn(9) + 1 {
+			buf.WriteRune('/')
+			buf.WriteString(val[prev:j])
+			prev = j
+		}
+		if prev < size {
+			buf.WriteRune('/')
+			buf.WriteString(val[prev:])
+		}
+		return buf.String()
+	}
+	index := rand.Intn(entries)
+	var query string
+	for i := 0; i < entries; i++ {
+		val := generate()
+		if i == index {
+			query = val
+		}
+		tree.Add(val, i)
+	}
+
+	for i := 0; i < b.N; i++ {
+		tree.Search(query)
+	}
 }

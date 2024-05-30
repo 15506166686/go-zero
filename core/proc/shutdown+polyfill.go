@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 package proc
 
@@ -14,5 +14,14 @@ func AddWrapUpListener(fn func()) func() {
 	return fn
 }
 
-func SetTimeoutToForceQuit(duration time.Duration) {
+// SetTimeToForceQuit does nothing on windows.
+func SetTimeToForceQuit(duration time.Duration) {
+}
+
+// Shutdown does nothing on windows.
+func Shutdown() {
+}
+
+// WrapUp does nothing on windows.
+func WrapUp() {
 }
