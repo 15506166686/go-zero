@@ -3,6 +3,7 @@ package mr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"runtime"
@@ -37,6 +38,36 @@ func TestFinish(t *testing.T) {
 
 	assert.Equal(t, uint32(10), atomic.LoadUint32(&total))
 	assert.Nil(t, err)
+}
+
+func TestFinishWithPartialErrors(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	errDummy := errors.New("dummy")
+
+	t.Run("one error", func(t *testing.T) {
+		err := Finish(func() error {
+			return errDummy
+		}, func() error {
+			return nil
+		}, func() error {
+			return nil
+		})
+
+		assert.Equal(t, errDummy, err)
+	})
+
+	t.Run("two errors", func(t *testing.T) {
+		err := Finish(func() error {
+			return errDummy
+		}, func() error {
+			return errDummy
+		}, func() error {
+			return nil
+		})
+
+		assert.Equal(t, errDummy, err)
+	})
 }
 
 func TestFinishNone(t *testing.T) {
@@ -118,11 +149,28 @@ func TestForEach(t *testing.T) {
 
 		assert.Equal(t, tasks/2, int(count))
 	})
+}
 
-	t.Run("all", func(t *testing.T) {
-		defer goleak.VerifyNone(t)
+func TestPanics(t *testing.T) {
+	defer goleak.VerifyNone(t)
 
-		assert.PanicsWithValue(t, "foo", func() {
+	const tasks = 1000
+	verify := func(t *testing.T, r any) {
+		panicStr := fmt.Sprintf("%v", r)
+		assert.Contains(t, panicStr, "foo")
+		assert.Contains(t, panicStr, "goroutine")
+		assert.Contains(t, panicStr, "runtime/debug.Stack")
+		panic(r)
+	}
+
+	t.Run("ForEach run panics", func(t *testing.T) {
+		assert.Panics(t, func() {
+			defer func() {
+				if r := recover(); r != nil {
+					verify(t, r)
+				}
+			}()
+
 			ForEach(func(source chan<- int) {
 				for i := 0; i < tasks; i++ {
 					source <- i
@@ -132,28 +180,31 @@ func TestForEach(t *testing.T) {
 			})
 		})
 	})
-}
 
-func TestGeneratePanic(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	t.Run("ForEach generate panics", func(t *testing.T) {
+		assert.Panics(t, func() {
+			defer func() {
+				if r := recover(); r != nil {
+					verify(t, r)
+				}
+			}()
 
-	t.Run("all", func(t *testing.T) {
-		assert.PanicsWithValue(t, "foo", func() {
 			ForEach(func(source chan<- int) {
 				panic("foo")
 			}, func(item int) {
 			})
 		})
 	})
-}
 
-func TestMapperPanic(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	const tasks = 1000
 	var run int32
-	t.Run("all", func(t *testing.T) {
-		assert.PanicsWithValue(t, "foo", func() {
+	t.Run("Mapper panics", func(t *testing.T) {
+		assert.Panics(t, func() {
+			defer func() {
+				if r := recover(); r != nil {
+					verify(t, r)
+				}
+			}()
+
 			_, _ = MapReduce(func(source chan<- int) {
 				for i := 0; i < tasks; i++ {
 					source <- i

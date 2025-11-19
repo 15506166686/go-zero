@@ -1,3 +1,5 @@
+//go:build !no_k8s
+
 package internal
 
 import (
@@ -26,16 +28,16 @@ type kubeResolver struct {
 	stopCh chan struct{}
 }
 
+func (r *kubeResolver) Close() {
+	close(r.stopCh)
+}
+
 func (r *kubeResolver) ResolveNow(_ resolver.ResolveNowOptions) {}
 
 func (r *kubeResolver) start() {
 	threading.GoSafe(func() {
 		r.inf.Start(r.stopCh)
 	})
-}
-
-func (r *kubeResolver) Close() {
-	close(r.stopCh)
 }
 
 type kubeBuilder struct{}
@@ -69,8 +71,9 @@ func (b *kubeBuilder) Build(target resolver.Target, cc resolver.ClientConn,
 	}
 
 	handler := kube.NewEventHandler(func(endpoints []string) {
-		var addrs []resolver.Address
-		for _, val := range subset(endpoints, subsetSize) {
+		endpoints = subset(endpoints, subsetSize)
+		addrs := make([]resolver.Address, 0, len(endpoints))
+		for _, val := range endpoints {
 			addrs = append(addrs, resolver.Address{
 				Addr: fmt.Sprintf("%s:%d", val, svc.Port),
 			})
